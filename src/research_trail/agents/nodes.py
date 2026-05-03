@@ -73,12 +73,20 @@ def search_papers(state: dict) -> dict:
         }
     from research_trail.search.aggregator import search_all
 
-    return {"papers": search_all(query, per_source_limit=10)}
+    return {"papers": search_all(query, per_source_limit=4)}
 
 
 @node("screen_and_extract")
 def screen_and_extract(state: dict) -> dict:
-    """Screen retrieved papers and extract claims/methods."""
+    """Screen retrieved papers and extract claims/methods.
+
+    Live mode runs ``extract_from_paper`` concurrently across papers because
+    each call is dominated by an OpenAI round-trip (10-20s) — serial execution
+    on 20 papers is the dominant bottleneck of the whole pipeline. Order is
+    preserved so ``extractions[i]`` still corresponds to ``papers[i]``.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
     from research_trail.extraction.extractor import Extraction, extract_from_paper
 
     papers: list[Paper] = state.get("papers", [])
@@ -95,7 +103,12 @@ def screen_and_extract(state: dict) -> dict:
                 for p in papers
             ]
         }
-    return {"extractions": [extract_from_paper(p) for p in papers]}
+    if not papers:
+        return {"extractions": []}
+    workers = min(get_settings().extract_concurrency, len(papers))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        extractions = list(pool.map(extract_from_paper, papers))
+    return {"extractions": extractions}
 
 
 @node("build_graph")

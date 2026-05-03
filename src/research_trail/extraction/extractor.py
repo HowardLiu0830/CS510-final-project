@@ -36,7 +36,12 @@ Abstract: {abstract}
 
 
 def extract_from_paper(paper: Paper) -> Extraction:
-    """Extract structured knowledge from a single paper."""
+    """Extract structured knowledge from a single paper.
+
+    On any LLM error we return an empty ``Extraction`` for the paper rather
+    than raising — one bad paper shouldn't sink the whole batch when we run
+    the extraction concurrently.
+    """
     if get_settings().offline:
         return Extraction(
             paper_id=paper.id,
@@ -49,13 +54,16 @@ def extract_from_paper(paper: Paper) -> Extraction:
     model = get_chat_model()
     if model is None:
         return Extraction(paper_id=paper.id)
-    structured = model.with_structured_output(_RawExtraction)
-    raw: _RawExtraction = structured.invoke(
-        _PROMPT.format(title=paper.title, abstract=paper.abstract or "")
-    )
-    return Extraction(
-        paper_id=paper.id,
-        claims=raw.claims,
-        methods=raw.methods,
-        evidence=raw.evidence,
-    )
+    try:
+        structured = model.with_structured_output(_RawExtraction)
+        raw: _RawExtraction = structured.invoke(
+            _PROMPT.format(title=paper.title, abstract=paper.abstract or "")
+        )
+        return Extraction(
+            paper_id=paper.id,
+            claims=raw.claims,
+            methods=raw.methods,
+            evidence=raw.evidence,
+        )
+    except Exception:
+        return Extraction(paper_id=paper.id, confidence=0.0)

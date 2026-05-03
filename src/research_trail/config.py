@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     s2_api_key: str | None = Field(default=None)
     openalex_email: str | None = Field(default=None)
     research_trail_cache_dir: Path = Field(default=PROJECT_ROOT / "data" / "cache")
+    extract_concurrency: int = Field(default=8, ge=1, le=32)
 
     @property
     def offline(self) -> bool:
