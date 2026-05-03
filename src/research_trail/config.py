@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     )
 
     openai_api_key: str | None = Field(default=None)
-    openai_model: str = Field(default="gpt-4o-mini")
+    openai_model: str = Field(default="gpt-5-nano")
     s2_api_key: str | None = Field(default=None)
     openalex_email: str | None = Field(default=None)
     research_trail_cache_dir: Path = Field(default=PROJECT_ROOT / "data" / "cache")
