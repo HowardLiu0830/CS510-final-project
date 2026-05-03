@@ -35,12 +35,6 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-## Offline mode
-
-If `OPENAI_API_KEY` is unset, agent nodes return deterministic stub data so the
-harness can be exercised without network access. This is the default for tests
-(forced in `tests/conftest.py`).
-
 ## Layout
 
 ```
@@ -120,3 +114,27 @@ make clean     # remove build/ dist/ caches
 - Eric — academic search + paper parsing + web interface
 - Haoyang — summary / flowchart generation, prompt design
 - Howard — evaluation (LLM-as-judge + human assessment)
+
+## Offline mode (tests / development only)
+
+> **Not a user-facing feature.** End users always run with a real
+> `OPENAI_API_KEY`; the stub outputs below are not useful results, only a way
+> to keep the harness importable and the UI navigable when no key is available.
+
+If `OPENAI_API_KEY` is unset (empty or missing), every LLM-touching node,
+extractor, and judge short-circuits to deterministic stub data and the search
+clients are skipped — the pipeline runs end-to-end with **zero network calls**.
+This exists to keep three workflows hermetic:
+
+- **`pytest`** — `tests/conftest.py` forces `OPENAI_API_KEY=""` so the suite
+  runs in ~0.2 s without burning tokens or depending on OpenAI uptime.
+- **Fresh clone** — teammates can `pip install -e . && streamlit run …` before
+  filling in `.env`; the UI loads, the LangGraph compiles, and the wiring is
+  visible (with a yellow "Offline mode" banner up top).
+- **UI / wiring iteration** — when changing `streamlit_app.py`, graph topology,
+  or `runlog`, you don't need to pay 1-6 minutes per reload to see the result.
+
+When offline, you'll see one stub sub-problem, one stub paper, stub
+extractions, and a templated synthesis line — proof the pipeline is connected,
+nothing more. Unset the key (`unset OPENAI_API_KEY`) or leave it blank in
+`.env` to enter offline mode; set a real key to leave it.
