@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research_trail"
+version = "0.1.0"
+description = "Research Trail Builder: graph-based knowledge maps for scientific literature exploration."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+authors = [
+  { name = "Lawrence Wang" },
+  { name = "Eric Chen" },
+  { name = "Haoyang Wang" },
+  { name = "Howard Liu" },
+]
+dependencies = [
+  "langchain>=0.3",
+  "langchain-openai",
+  "langgraph>=0.2",
+  "openai",
+  "streamlit",
+  "streamlit-agraph",
+  "pyvis",
+  "networkx",
+  "pyalex",
+  "arxiv",
+  "requests",
+  "httpx",
+  "tenacity",
+  "pydantic>=2",
+  "pydantic-settings",
+  "python-dotenv",
+  "pandas",
+  "numpy",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-asyncio",
+  "ruff",
+  "black",
+  "ipykernel",
+  "jupyter",
+]
+
+[project.scripts]
+research-trail-agent = "research_trail.cli:run_agent"
+research-trail-eval = "research_trail.cli:run_eval"
+research-trail-runs-to-jsonl = "research_trail.cli:runs_to_jsonl"
+research-trail-scaffold-human-eval = "research_trail.cli:scaffold_human_eval"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
