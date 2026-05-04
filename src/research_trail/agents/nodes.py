@@ -55,8 +55,15 @@ def scope_query(state: dict) -> dict:
 
 @node("search_papers")
 def search_papers(state: dict) -> dict:
-    """Search academic databases for relevant papers."""
+    """Search academic databases for relevant papers.
+
+    Searches the main query and each sub-problem separately, then deduplicates
+    across all searches so that diverse sub-topics each get their own coverage.
+    Results from each (query, source) pair are disk-cached to avoid redundant
+    API calls on repeated or overlapping sub-problems.
+    """
     query = state.get("query", "")
+    sub_problems = state.get("sub_problems", [])
     if get_settings().offline:
         return {
             "papers": [
@@ -73,7 +80,18 @@ def search_papers(state: dict) -> dict:
         }
     from research_trail.search.aggregator import search_all
 
-    return {"papers": search_all(query, per_source_limit=4)}
+    # Search the main query and each sub-problem; deduplicate across all results.
+    queries = list(dict.fromkeys([query] + sub_problems))[:6]  # cap total searches
+    seen_keys: set[str] = set()
+    all_papers: list[Paper] = []
+    for q in queries:
+        for p in search_all(q, per_source_limit=3):
+            key = f"doi:{p.doi.lower().strip()}" if p.doi else f"title:{p.title.lower().strip()}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            all_papers.append(p)
+    return {"papers": all_papers}
 
 
 @node("screen_and_extract")
