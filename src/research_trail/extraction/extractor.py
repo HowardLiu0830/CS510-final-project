@@ -59,11 +59,16 @@ def extract_from_paper(paper: Paper) -> Extraction:
         raw: _RawExtraction = structured.invoke(
             _PROMPT.format(title=paper.title, abstract=paper.abstract or "")
         )
+        # Confidence reflects extraction completeness: ratio of items found vs.
+        # the maximum the prompt asks for (5 claims + 3 methods + 3 evidence = 11).
+        n_items = len(raw.claims) + len(raw.methods) + len(raw.evidence)
+        confidence = round(min(1.0, n_items / 11.0), 3)
         return Extraction(
             paper_id=paper.id,
             claims=raw.claims,
             methods=raw.methods,
             evidence=raw.evidence,
+            confidence=confidence,
         )
     except Exception:
         return Extraction(paper_id=paper.id, confidence=0.0)
