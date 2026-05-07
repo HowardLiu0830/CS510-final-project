@@ -6,6 +6,7 @@ from langgraph.graph import END, START, StateGraph
 
 from research_trail.agents.nodes import (
     build_graph,
+    identify_gaps,
     scope_query,
     screen_and_extract,
     search_papers,
@@ -21,12 +22,14 @@ def compile_graph():
     sg.add_node("screen_and_extract", screen_and_extract)
     sg.add_node("build_graph", build_graph)
     sg.add_node("synthesize", synthesize)
+    sg.add_node("identify_gaps", identify_gaps)
 
     sg.add_edge(START, "scope_query")
     sg.add_edge("scope_query", "search_papers")
     sg.add_edge("search_papers", "screen_and_extract")
     sg.add_edge("screen_and_extract", "build_graph")
     sg.add_edge("build_graph", "synthesize")
-    sg.add_edge("synthesize", END)
+    sg.add_edge("synthesize", "identify_gaps")
+    sg.add_edge("identify_gaps", END)
 
     return sg.compile()

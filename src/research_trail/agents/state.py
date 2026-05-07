@@ -15,4 +15,5 @@ class ResearchState(TypedDict, total=False):
     extractions: list[Extraction]
     graph: dict
     summary: str
+    gaps: list[str]
     judgments: dict

@@ -21,14 +21,18 @@ class _RawExtraction(BaseModel):
     claims: list[str] = Field(default_factory=list)
     methods: list[str] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 _PROMPT = """You are a careful research assistant. Read the paper below and extract:
 1. Up to 5 key claims (assertions the paper makes)
 2. Up to 3 methods or techniques used
 3. Up to 3 pieces of evidence supporting the main claim
+4. Your confidence in the extraction (0.0–1.0): use 0.9+ when the abstract is
+   detailed and claims are explicit; use 0.5 or below when it is vague or very short.
 
-Return JSON with keys: claims, methods, evidence (each a list of strings).
+Return JSON with keys: claims, methods, evidence (lists of strings) and
+confidence (a float 0.0–1.0).
 
 Title: {title}
 Abstract: {abstract}
@@ -59,16 +63,12 @@ def extract_from_paper(paper: Paper) -> Extraction:
         raw: _RawExtraction = structured.invoke(
             _PROMPT.format(title=paper.title, abstract=paper.abstract or "")
         )
-        # Confidence reflects extraction completeness: ratio of items found vs.
-        # the maximum the prompt asks for (5 claims + 3 methods + 3 evidence = 11).
-        n_items = len(raw.claims) + len(raw.methods) + len(raw.evidence)
-        confidence = round(min(1.0, n_items / 11.0), 3)
         return Extraction(
             paper_id=paper.id,
             claims=raw.claims,
             methods=raw.methods,
             evidence=raw.evidence,
-            confidence=confidence,
+            confidence=round(raw.confidence, 3),
         )
     except Exception:
         return Extraction(paper_id=paper.id, confidence=0.0)

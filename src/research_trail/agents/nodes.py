@@ -78,14 +78,19 @@ def search_papers(state: dict) -> dict:
                 )
             ]
         }
+    from concurrent.futures import ThreadPoolExecutor
+
     from research_trail.search.aggregator import search_all
 
-    # Search the main query and each sub-problem; deduplicate across all results.
+    # Search the main query and each sub-problem in parallel, then deduplicate.
     queries = list(dict.fromkeys([query] + sub_problems))[:6]  # cap total searches
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        results_per_query = list(pool.map(lambda q: search_all(q, per_source_limit=3), queries))
+
     seen_keys: set[str] = set()
     all_papers: list[Paper] = []
-    for q in queries:
-        for p in search_all(q, per_source_limit=3):
+    for papers in results_per_query:
+        for p in papers:
             key = f"doi:{p.doi.lower().strip()}" if p.doi else f"title:{p.title.lower().strip()}"
             if key in seen_keys:
                 continue
@@ -127,6 +132,86 @@ def screen_and_extract(state: dict) -> dict:
     with ThreadPoolExecutor(max_workers=workers) as pool:
         extractions = list(pool.map(extract_from_paper, papers))
     return {"extractions": extractions}
+
+
+class _Gaps(BaseModel):
+    gaps: list[str] = Field(default_factory=list)
+
+
+_GAP_PROMPT = """You are a research librarian conducting a systematic literature review.
+Based on the synthesis and concept-graph statistics below, identify 3-5 concrete
+research gaps — areas that are understudied, have contradictory findings, or where
+current methods fall short. Ground each gap in the evidence: reference specific
+concepts or methods where possible.
+
+Query: {query}
+
+Synthesis:
+{summary}
+
+Concept-graph statistics:
+- {n_papers} papers, {n_concepts} distinct concepts, {n_edges} relationships
+- Most cross-referenced concepts: {top_concepts}
+- Concepts cited by only one paper (potentially niche): {niche_concepts}
+
+Return JSON with one field: gaps (a list of 3-5 strings).
+"""
+
+
+def _graph_stats(graph: dict) -> dict:
+    """Compute concept-frequency stats from a serialised graph dict."""
+    from collections import Counter
+
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    concept_counts: Counter[str] = Counter()
+    for e in edges:
+        if e.get("source", "").startswith("paper:"):
+            concept_counts[e.get("target", "")] += 1
+    node_label = {n["id"]: n.get("label", n["id"]) for n in nodes}
+    top = [node_label[cid] for cid, _ in concept_counts.most_common(8) if cid in node_label]
+    niche = [
+        node_label[cid]
+        for cid, cnt in concept_counts.items()
+        if cnt == 1 and cid in node_label
+    ][:5]
+    return {
+        "n_papers": sum(1 for n in nodes if n.get("kind") == "paper"),
+        "n_concepts": sum(1 for n in nodes if n.get("kind") in ("claim", "method")),
+        "n_edges": len(edges),
+        "top_concepts": ", ".join(top) or "(none)",
+        "niche_concepts": ", ".join(niche) or "(none)",
+    }
+
+
+@node("identify_gaps")
+def identify_gaps(state: dict) -> dict:
+    """Surface research gaps from the synthesized literature and concept graph."""
+    from research_trail.graph.builder import enrich_graph_with_gaps
+
+    query = state.get("query", "")
+    graph = state.get("graph", {}) or {}
+
+    if get_settings().offline:
+        gaps = [f"Open question in '{query}': further study needed (stub)"]
+        return {"gaps": gaps, "graph": enrich_graph_with_gaps(graph, gaps)}
+
+    model = get_chat_model()
+    if model is None:
+        return {"gaps": [], "graph": graph}
+    try:
+        structured = model.with_structured_output(_Gaps)
+        out: _Gaps = structured.invoke(
+            _GAP_PROMPT.format(
+                query=query,
+                summary=(state.get("summary") or "")[:3000],
+                **_graph_stats(graph),
+            )
+        )
+        gaps = [g.strip() for g in out.gaps if g.strip()]
+        return {"gaps": gaps, "graph": enrich_graph_with_gaps(graph, gaps)}
+    except Exception:
+        return {"gaps": [], "graph": graph}
 
 
 @node("build_graph")
