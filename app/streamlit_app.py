@@ -100,12 +100,16 @@ def _render_graph_interactive(
             kind = n.get("kind", "")
             nid = n["id"]
 
+            if kind == "gap":
+                continue  # gaps shown in text expander, not graph
             if kind in ("claim", "method") and nid not in top_concepts:
                 continue
 
             if kind == "paper" and nid in paper_index:
                 idx, paper = paper_index[nid]
-                tooltip = paper.title + (f"\n\n📝 {annotations[nid]}" if annotations.get(nid) else "")
+                # title = URL so double-click opens the paper; hover shows the URL.
+                # (streamlit-agraph uses title's innerHTML as the double-click navigation target)
+                paper_url = paper.url if (paper.url and paper.url.startswith("http")) else None
                 nodes.append(
                     Node(
                         id=nid,
@@ -113,33 +117,20 @@ def _render_graph_interactive(
                         shape="circle",
                         color=_NODE_COLOR["paper"],
                         size=28,
-                        title=tooltip,
+                        title=paper_url,
                         font={"color": "white", "size": 12, "bold": True},
-                        url=paper.url or "",
                     )
                 )
                 continue
-            elif kind == "gap" and nid in gap_index:
-                idx, gap_text = gap_index[nid]
-                label = f"G{idx}"
-                shape = "circle"
-                size = 22
-                tooltip = gap_text + (f"\n\n📝 {annotations[nid]}" if annotations.get(nid) else "")
-            else:
-                raw_label = n.get("label", "")
-                label = ""
-                shape = "circle"
-                size = 14
-                tooltip = raw_label + (f"\n\n📝 {annotations[nid]}" if annotations.get(nid) else "")
 
+            raw_label = n.get("label", "")
             nodes.append(
                 Node(
                     id=nid,
-                    label=label,
-                    shape=shape,
+                    label="",
+                    shape="circle",
                     color=_NODE_COLOR.get(kind, "#aaaaaa"),
-                    size=size,
-                    title=tooltip,
+                    size=14,
                     font={"color": "white", "size": 12, "bold": True},
                 )
             )
@@ -147,7 +138,7 @@ def _render_graph_interactive(
         # Only draw edges whose target concept node is actually being rendered.
         rendered_ids = {n.id for n in nodes}
         edges = [
-            Edge(source=e["source"], target=e["target"])
+            Edge(source=e["source"], target=e["target"], label=e.get("relation", ""))
             for e in g.get("edges", [])
             if e["source"] in rendered_ids and e["target"] in rendered_ids
         ]
@@ -360,14 +351,13 @@ if result:
         st.subheader("Concept Graph")
 
         # Legend
-        legend_cols = st.columns(4)
+        legend_cols = st.columns(3)
         for col, (color, label) in zip(
             legend_cols,
             [
                 (_NODE_COLOR["paper"], "= Paper"),
                 (_NODE_COLOR["claim"], "= Claim"),
                 (_NODE_COLOR["method"], "= Method"),
-                (_NODE_COLOR["gap"], "= Gap"),
             ],
         ):
             col.markdown(
@@ -375,7 +365,7 @@ if result:
                 unsafe_allow_html=True,
             )
 
-        st.caption("Papers = P1, P2… · Gaps = G1, G2… · Hover any node for full text · Click to inspect · Claim/method/gap nodes can be expanded")
+        st.caption("Papers = P1, P2… · Gaps = G1, G2… · Single-click to inspect · Double-click a paper to open it · Claim/method/gap nodes can be expanded")
         clicked = _render_graph_interactive(g, st.session_state.annotations, paper_index, gap_index)
         if clicked:
             st.session_state.selected_node = clicked
