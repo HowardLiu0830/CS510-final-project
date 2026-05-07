@@ -64,6 +64,7 @@ def serialize_state(query: str, state: dict) -> dict:
         "extractions": [_dump(e) for e in state.get("extractions", [])],
         "graph": state.get("graph", {}),
         "summary": state.get("summary", ""),
+        "gaps": state.get("gaps", []),
     }
 
 

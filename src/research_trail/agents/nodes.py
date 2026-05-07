@@ -129,6 +129,46 @@ def screen_and_extract(state: dict) -> dict:
     return {"extractions": extractions}
 
 
+class _Gaps(BaseModel):
+    gaps: list[str] = Field(default_factory=list)
+
+
+_GAP_PROMPT = """You are a research librarian conducting a systematic literature review.
+Based on the synthesis below, identify 3-5 concrete research gaps — areas that are
+understudied, have contradictory findings, or where current methods fall short.
+Each gap should be a specific, actionable statement, not a generic observation.
+
+Query: {query}
+
+Synthesis:
+{summary}
+
+Return JSON with one field: gaps (a list of 3-5 strings).
+"""
+
+
+@node("identify_gaps")
+def identify_gaps(state: dict) -> dict:
+    """Surface research gaps from the synthesized literature."""
+    query = state.get("query", "")
+    if get_settings().offline:
+        return {"gaps": [f"Open question in '{query}': further study needed (stub)"]}
+    model = get_chat_model()
+    if model is None:
+        return {"gaps": []}
+    try:
+        structured = model.with_structured_output(_Gaps)
+        out: _Gaps = structured.invoke(
+            _GAP_PROMPT.format(
+                query=query,
+                summary=(state.get("summary") or "")[:3000],
+            )
+        )
+        return {"gaps": [g.strip() for g in out.gaps if g.strip()]}
+    except Exception:
+        return {"gaps": []}
+
+
 @node("build_graph")
 def build_graph(state: dict) -> dict:
     """Construct the concept graph from extractions."""
