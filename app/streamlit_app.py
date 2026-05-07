@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import streamlit as st
 
@@ -16,7 +19,12 @@ st.title("Research Trail Builder")
 st.caption("Graph-based knowledge maps of scientific literature.")
 
 # ── session state ─────────────────────────────────────────────────────────────
-for _key, _default in [("result", None), ("annotations", {}), ("selected_node", None)]:
+for _key, _default in [
+    ("result", None),
+    ("annotations", {}),
+    ("selected_node", None),
+    ("eval_result", None),
+]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
 
@@ -34,30 +42,127 @@ query = st.text_input(
 run = st.button("Run", type="primary", disabled=not query)
 
 # ── graph helpers ─────────────────────────────────────────────────────────────
-_NODE_COLOR = {"paper": "#4a90d9", "claim": "#27ae60", "method": "#e67e22"}
-_NODE_SIZE = {"paper": 25, "claim": 12, "method": 12}
+_NODE_COLOR = {
+    "paper": "#4a90d9",
+    "claim": "#27ae60",
+    "method": "#e67e22",
+    "gap": "#e74c3c",
+}
 
 
-def _render_graph_interactive(g: dict, annotations: dict) -> str | None:
+def _build_paper_index(g: dict, papers: list) -> dict[str, tuple[int, Any]]:
+    """Map paper node ID → (1-based display index, Paper object)."""
+    lookup = {f"paper:{p.id}": p for p in papers}
+    index: dict[str, tuple[int, Any]] = {}
+    n = 0
+    for node in g.get("nodes", []):
+        nid = node["id"]
+        if node.get("kind") == "paper" and nid in lookup:
+            n += 1
+            index[nid] = (n, lookup[nid])
+    return index
+
+
+def _build_gap_index(g: dict) -> dict[str, tuple[int, str]]:
+    """Map gap node ID → (1-based display index, gap text)."""
+    index: dict[str, tuple[int, str]] = {}
+    n = 0
+    for node in g.get("nodes", []):
+        if node.get("kind") == "gap":
+            n += 1
+            index[node["id"]] = (n, node.get("label", node["id"]))
+    return index
+
+
+def _render_graph_interactive(
+    g: dict,
+    annotations: dict,
+    paper_index: dict,
+    gap_index: dict,
+) -> str | None:
     """Render the concept graph and return the clicked node ID (or None)."""
     try:
         from streamlit_agraph import Config, Edge, Node, agraph
 
-        nodes = [
-            Node(
-                id=n["id"],
-                label=n.get("label", n["id"])[:40],
-                color=_NODE_COLOR.get(n.get("kind", ""), "#aaaaaa"),
-                size=_NODE_SIZE.get(n.get("kind", ""), 12),
-                title=annotations.get(n["id"], ""),  # shown as tooltip
+        # Rank concept nodes by how many papers reference them; keep top 30.
+        concept_paper_count: dict[str, int] = {}
+        for e in g.get("edges", []):
+            if e.get("source", "").startswith("paper:"):
+                concept_paper_count[e.get("target", "")] = (
+                    concept_paper_count.get(e.get("target", ""), 0) + 1
+                )
+        top_concepts: set[str] = set(
+            nid for nid, _ in sorted(concept_paper_count.items(), key=lambda x: -x[1])[:30]
+        )
+
+        nodes = []
+        for n in g.get("nodes", []):
+            kind = n.get("kind", "")
+            nid = n["id"]
+
+            if kind in ("claim", "method") and nid not in top_concepts:
+                continue
+
+            if kind == "paper" and nid in paper_index:
+                idx, paper = paper_index[nid]
+                tooltip = paper.title + (f"\n\n📝 {annotations[nid]}" if annotations.get(nid) else "")
+                nodes.append(
+                    Node(
+                        id=nid,
+                        label=f"P{idx}",
+                        shape="circle",
+                        color=_NODE_COLOR["paper"],
+                        size=28,
+                        title=tooltip,
+                        font={"color": "white", "size": 12, "bold": True},
+                        url=paper.url or "",
+                    )
+                )
+                continue
+            elif kind == "gap" and nid in gap_index:
+                idx, gap_text = gap_index[nid]
+                label = f"G{idx}"
+                shape = "circle"
+                size = 22
+                tooltip = gap_text + (f"\n\n📝 {annotations[nid]}" if annotations.get(nid) else "")
+            else:
+                raw_label = n.get("label", "")
+                label = ""
+                shape = "circle"
+                size = 14
+                tooltip = raw_label + (f"\n\n📝 {annotations[nid]}" if annotations.get(nid) else "")
+
+            nodes.append(
+                Node(
+                    id=nid,
+                    label=label,
+                    shape=shape,
+                    color=_NODE_COLOR.get(kind, "#aaaaaa"),
+                    size=size,
+                    title=tooltip,
+                    font={"color": "white", "size": 12, "bold": True},
+                )
             )
-            for n in g.get("nodes", [])
-        ]
+
+        # Only draw edges whose target concept node is actually being rendered.
+        rendered_ids = {n.id for n in nodes}
         edges = [
-            Edge(source=e["source"], target=e["target"], label=e.get("relation", ""))
+            Edge(source=e["source"], target=e["target"])
             for e in g.get("edges", [])
+            if e["source"] in rendered_ids and e["target"] in rendered_ids
         ]
-        config = Config(width="100%", height=500, directed=True, physics=True)
+        config = Config(
+            width="100%",
+            height=500,
+            directed=True,
+            physics=True,
+            solver="repulsion",
+            repulsion={
+                "nodeDistance": 100,
+                "springLength": 120,
+                "damping": 0.9,
+            },
+        )
         return agraph(nodes=nodes, edges=edges, config=config)
     except Exception as exc:
         st.json(g)
@@ -72,7 +177,7 @@ def _expand_node(concept_label: str, result: dict) -> None:
         return
 
     from research_trail.extraction.extractor import extract_from_paper
-    from research_trail.graph.builder import build_concept_graph
+    from research_trail.graph.builder import build_concept_graph, enrich_graph_with_gaps
     from research_trail.search.aggregator import search_all
 
     with st.spinner(f"Expanding '{concept_label}'…"):
@@ -94,34 +199,49 @@ def _expand_node(concept_label: str, result: dict) -> None:
         result["papers"] = result.get("papers", []) + fresh
         all_extractions = result.get("extractions", []) + new_extractions
         result["extractions"] = all_extractions
-        result["graph"] = build_concept_graph(all_extractions)
+        result["graph"] = enrich_graph_with_gaps(
+            build_concept_graph(all_extractions),
+            result.get("gaps", []),
+        )
         st.session_state.result = result
 
 
-def _render_node_inspector(node_id: str, g: dict, result: dict) -> None:
+def _render_node_inspector(
+    node_id: str,
+    g: dict,
+    result: dict,
+    paper_index: dict,
+    gap_index: dict,
+) -> None:
     """Show metadata, annotation editor, and expand button for a selected node."""
     node_meta = next((n for n in g.get("nodes", []) if n["id"] == node_id), None)
     if not node_meta:
         return
 
     kind = node_meta.get("kind", "unknown")
-    label = node_meta.get("label", node_id)
 
     with st.container(border=True):
-        st.markdown(f"**[{kind}]** {label}")
+        if kind == "paper" and node_id in paper_index:
+            idx, paper = paper_index[node_id]
+            st.markdown(f"**P{idx} · {paper.title}**")
+            st.caption(
+                f"{', '.join(paper.authors[:3])} · {paper.year or 'n/a'} · {paper.source}"
+            )
+            if paper.abstract:
+                with st.expander("Abstract"):
+                    st.write(paper.abstract)
+            if paper.url:
+                st.markdown(f"[Open paper →]({paper.url})")
 
-        if kind == "paper":
-            paper_id = node_id.removeprefix("paper:")
-            paper = next((p for p in result.get("papers", []) if p.id == paper_id), None)
-            if paper:
-                title_md = f"[{paper.title}]({paper.url})" if paper.url else paper.title
-                st.markdown(title_md)
-                st.caption(
-                    f"{', '.join(paper.authors[:3])} · {paper.year or 'n/a'} · {paper.source}"
-                )
-                if paper.abstract:
-                    with st.expander("Abstract"):
-                        st.write(paper.abstract)
+        elif kind == "gap" and node_id in gap_index:
+            idx, gap_text = gap_index[node_id]
+            st.markdown(f"**G{idx} · Research gap**")
+            st.write(gap_text)
+
+        else:
+            label = node_meta.get("label", node_id)
+            kind_badge = {"claim": "💬 Claim", "method": "🔧 Method"}.get(kind, kind)
+            st.markdown(f"**{kind_badge}:** {label}")
 
         annotation_key = f"ann_{node_id}"
         current_note = st.session_state.annotations.get(node_id, "")
@@ -138,7 +258,8 @@ def _render_node_inspector(node_id: str, g: dict, result: dict) -> None:
                 st.session_state.annotations[node_id] = note
                 st.success("Saved.")
         with col_expand:
-            if kind in ("claim", "method"):
+            if kind in ("claim", "method", "gap"):
+                label = node_meta.get("label", node_id)
                 if st.button("Expand topic", key=f"expand_{node_id}", type="primary"):
                     _expand_node(label, st.session_state.result)
                     st.rerun()
@@ -148,6 +269,7 @@ def _render_node_inspector(node_id: str, g: dict, result: dict) -> None:
 if run and query:
     st.session_state.result = None
     st.session_state.selected_node = None
+    st.session_state.eval_result = None
 
     with open_run(query) as run_dir:
         with st.status("Running pipeline…", expanded=True) as status:
@@ -187,25 +309,104 @@ if result:
             for i, gap in enumerate(gaps, 1):
                 st.markdown(f"**{i}.** {gap}")
 
+    # Evaluate + download row
+    col_eval, col_dl, _ = st.columns([1, 1, 3])
+    with col_eval:
+        if st.button("Evaluate with LLM judge"):
+            from research_trail.evaluation.llm_judge import judge
+
+            with st.spinner("Running LLM judge…"):
+                g_ref = result.get("graph", {})
+                rubric = judge(
+                    result.get("query", query),
+                    {
+                        "summary": summary,
+                        "gaps": gaps,
+                        "graph": {
+                            "nodes": len(g_ref.get("nodes", [])),
+                            "edges": len(g_ref.get("edges", [])),
+                        },
+                    },
+                )
+                st.session_state.eval_result = rubric
+
+    with col_dl:
+        graph_json = json.dumps(result.get("graph", {}), indent=2, default=str)
+        st.download_button(
+            "Download graph JSON",
+            data=graph_json,
+            file_name="concept_graph.json",
+            mime="application/json",
+        )
+
+    eval_result = st.session_state.get("eval_result")
+    if eval_result:
+        score = eval_result.score
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Relevance", f"{score.relevance}/5")
+        c2.metric("Coverage", f"{score.coverage}/5")
+        c3.metric("Structure", f"{score.structural_organization}/5")
+        c4.metric("Insightfulness", f"{score.insightfulness}/5")
+        c5.metric("Overall", f"{score.mean:.1f}/5")
+        if score.rationale:
+            st.caption(f"Judge rationale: {score.rationale}")
+
+    papers = result.get("papers", [])
     g = result.get("graph", {})
+    paper_index = _build_paper_index(g, papers) if g else {}
+    gap_index = _build_gap_index(g) if g else {}
+
     if g and g.get("nodes"):
         st.subheader("Concept Graph")
-        st.caption(
-            "Click a node to inspect it or add notes. "
-            "Claim/method nodes have an **Expand topic** button to fetch more papers."
-        )
-        clicked = _render_graph_interactive(g, st.session_state.annotations)
+
+        # Legend
+        legend_cols = st.columns(4)
+        for col, (color, label) in zip(
+            legend_cols,
+            [
+                (_NODE_COLOR["paper"], "= Paper"),
+                (_NODE_COLOR["claim"], "= Claim"),
+                (_NODE_COLOR["method"], "= Method"),
+                (_NODE_COLOR["gap"], "= Gap"),
+            ],
+        ):
+            col.markdown(
+                f'<span style="color:{color}; font-size:1.2em">⬤</span> {label}',
+                unsafe_allow_html=True,
+            )
+
+        st.caption("Papers = P1, P2… · Gaps = G1, G2… · Hover any node for full text · Click to inspect · Claim/method/gap nodes can be expanded")
+        clicked = _render_graph_interactive(g, st.session_state.annotations, paper_index, gap_index)
         if clicked:
             st.session_state.selected_node = clicked
 
         sel = st.session_state.selected_node
         if sel:
-            _render_node_inspector(sel, g, result)
+            _render_node_inspector(sel, g, result, paper_index, gap_index)
 
+        # Paper index table
+        if paper_index:
+            st.markdown("**Paper index**")
+            for nid, (idx, paper) in sorted(paper_index.items(), key=lambda x: x[1][0]):
+                link = f"[{paper.title}]({paper.url})" if paper.url else paper.title
+                authors = ", ".join(paper.authors[:2]) + (" et al." if len(paper.authors) > 2 else "")
+                st.markdown(f"**P{idx}** · {link} · {authors} · {paper.year or 'n/a'} · `{paper.source}`")
+
+        # Gap index table
+        if gap_index:
+            st.markdown("**Gap index**")
+            for nid, (idx, gap_text) in sorted(gap_index.items(), key=lambda x: x[1][0]):
+                st.markdown(f"**G{idx}** · {gap_text}")
+
+    # Papers + Extractions tabs
     tab_papers, tab_extractions = st.tabs(["Papers", "Extractions"])
     with tab_papers:
-        papers = result.get("papers", [])
         if papers:
+            source_counts = Counter(p.source for p in papers)
+            src_cols = st.columns(len(source_counts))
+            for col, (src, cnt) in zip(src_cols, sorted(source_counts.items())):
+                col.metric(src, cnt)
+            st.divider()
             for p in papers:
                 title_md = f"[{p.title}]({p.url})" if p.url else p.title
                 st.markdown(
