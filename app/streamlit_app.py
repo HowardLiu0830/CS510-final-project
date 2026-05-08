@@ -419,43 +419,49 @@ if result:
                 st.info("Click a node in the graph to inspect details.")
 
         # Paper index table
-        if paper_index:
-            st.markdown("**Paper index**")
-            for nid, (idx, paper) in sorted(paper_index.items(), key=lambda x: x[1][0]):
-                link = f"[{paper.title}]({paper.url})" if paper.url else paper.title
-                authors = ", ".join(paper.authors[:2]) + (" et al." if len(paper.authors) > 2 else "")
-                st.markdown(f"**P{idx}** · {link} · {authors} · {paper.year or 'n/a'} · `{paper.source}`")
+        # if paper_index:
+        #     st.markdown("**Paper index**")
+        #     for nid, (idx, paper) in sorted(paper_index.items(), key=lambda x: x[1][0]):
+        #         link = f"[{paper.title}]({paper.url})" if paper.url else paper.title
+        #         authors = ", ".join(paper.authors[:2]) + (" et al." if len(paper.authors) > 2 else "")
+        #         st.markdown(f"**P{idx}** · {link} · {authors} · {paper.year or 'n/a'} · `{paper.source}`")
 
         # Gap index table
         if gap_index:
-            st.markdown("**Gap index**")
+            st.subheader("Gap index")
             for nid, (idx, gap_text) in sorted(gap_index.items(), key=lambda x: x[1][0]):
                 st.markdown(f"**G{idx}** · {gap_text}")
 
-    # Papers + Extractions tabs
-    tab_papers, tab_extractions = st.tabs(["Papers", "Extractions"])
-    with tab_papers:
-        if papers:
-            source_counts = Counter(p.source for p in papers)
-            src_cols = st.columns(len(source_counts))
-            for col, (src, cnt) in zip(src_cols, sorted(source_counts.items())):
-                col.metric(src, cnt)
-            st.divider()
-            for p in papers:
-                title_md = f"[{p.title}]({p.url})" if p.url else p.title
+    
+    st.subheader("Paper Index and Extractions")
+    # Merged Papers + Extractions view
+    extractions = result.get("extractions", [])
+    if not papers:
+        st.info("No papers retrieved.")
+    elif not extractions:
+        st.info("No extractions available.")
+    else:
+        # Build a mapping from paper id to (index, Paper object)
+        paper_display_index = {p.id: (idx, p) for idx, (nid, (idx, p)) in enumerate(sorted(paper_index.items(), key=lambda x: x[1][0]), 1)}
+        # Map paper_id → first extraction (by order in extractions)
+        paper_to_extraction = {}
+        for ext in extractions:
+            paper_to_extraction.setdefault(ext.paper_id, ext)
+        for nid, (idx, paper) in sorted(paper_index.items(), key=lambda x: x[1][0]):
+            ext = paper_to_extraction.get(paper.id)
+            reference = f"**[P{idx}]**"
+            title_md = paper.title
+            conf_pct = f"{ext.confidence * 100:.0f}%" if ext and hasattr(ext, "confidence") else "n/a"
+            expander_label = f"{reference} {paper.title}  (confidence: {conf_pct})"
+            with st.expander(expander_label):
                 st.markdown(
-                    f"**{title_md}** · {', '.join(p.authors[:3])} · "
-                    f"{p.year or 'n/a'} · `{p.source}`"
+                    f"**URL**: {paper.url}<br>"
+                    f"**Authors**: {', '.join(paper.authors[:3])}{' et al.' if len(paper.authors) > 3 else ''}<br>"
+                    f"**Year**: {paper.year or 'n/a'} &nbsp; | &nbsp; **Source**: `{paper.source}`",
+                    unsafe_allow_html=True,
                 )
-        else:
-            st.info("No papers retrieved.")
-
-    with tab_extractions:
-        extractions = result.get("extractions", [])
-        if extractions:
-            for ext in extractions:
-                conf_pct = f"{ext.confidence * 100:.0f}%"
-                with st.expander(f"{ext.paper_id}  (confidence: {conf_pct})"):
+           
+                if ext:
                     if ext.claims:
                         st.markdown("**Claims:**")
                         for c in ext.claims:
@@ -468,5 +474,5 @@ if result:
                         st.markdown("**Evidence:**")
                         for e in ext.evidence:
                             st.markdown(f"- {e}")
-        else:
-            st.info("No extractions available.")
+                else:
+                    st.info("No extraction available for this paper.")
