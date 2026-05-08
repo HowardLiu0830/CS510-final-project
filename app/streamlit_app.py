@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -72,6 +73,28 @@ def _build_gap_index(g: dict) -> dict[str, tuple[int, str]]:
             n += 1
             index[node["id"]] = (n, node.get("label", node["id"]))
     return index
+
+
+def _annotate_summary_with_paper_refs(summary: str, paper_index: dict[str, tuple[int, Any]]) -> str:
+    """Append clickable [P#] references after paper titles in synthesis text."""
+    if not summary or not paper_index:
+        return summary
+
+    title_refs = sorted(
+        (
+            (paper.title, idx, getattr(paper, "url", ""))
+            for idx, paper in paper_index.values()
+            if getattr(paper, "title", "")
+        ),
+        key=lambda x: len(x[0]),
+        reverse=True,
+    )
+    annotated = summary
+    for title, idx, url in title_refs:
+        pattern = re.compile(rf"{re.escape(title)}(?!\s*\[P\d+\])")
+        ref = f"[\\[P{idx}\\]]({url})" if url else f"\\[P{idx}\\]"
+        annotated = pattern.sub(lambda m: f"{m.group(0)} {ref}", annotated)
+    return annotated
 
 
 def _render_graph_interactive(
@@ -147,7 +170,12 @@ def _render_graph_interactive(
         # Only draw edges whose target concept node is actually being rendered.
         rendered_ids = {n.id for n in nodes}
         edges = [
-            Edge(source=e["source"], target=e["target"])
+            Edge(
+                source=e["source"],
+                target=e["target"],
+                label=e.get("relation", ""),
+                font={"size": 10, "align": "middle"},
+            )
             for e in g.get("edges", [])
             if e["source"] in rendered_ids and e["target"] in rendered_ids
         ]
@@ -298,10 +326,15 @@ if run and query:
 # ── results rendering ─────────────────────────────────────────────────────────
 result = st.session_state.get("result")
 if result:
+    papers = result.get("papers", [])
+    g = result.get("graph", {})
+    paper_index = _build_paper_index(g, papers) if g else {}
+    gap_index = _build_gap_index(g) if g else {}
+
     summary = result.get("summary", "")
     if summary:
         st.subheader("Synthesis")
-        st.write(summary)
+        st.markdown(_annotate_summary_with_paper_refs(summary, paper_index))
 
     gaps = result.get("gaps", [])
     if gaps:
@@ -351,11 +384,6 @@ if result:
         if score.rationale:
             st.caption(f"Judge rationale: {score.rationale}")
 
-    papers = result.get("papers", [])
-    g = result.get("graph", {})
-    paper_index = _build_paper_index(g, papers) if g else {}
-    gap_index = _build_gap_index(g) if g else {}
-
     if g and g.get("nodes"):
         st.subheader("Concept Graph")
 
@@ -375,14 +403,20 @@ if result:
                 unsafe_allow_html=True,
             )
 
-        st.caption("Papers = P1, P2… · Gaps = G1, G2… · Hover any node for full text · Click to inspect · Claim/method/gap nodes can be expanded")
-        clicked = _render_graph_interactive(g, st.session_state.annotations, paper_index, gap_index)
-        if clicked:
-            st.session_state.selected_node = clicked
-
-        sel = st.session_state.selected_node
-        if sel:
-            _render_node_inspector(sel, g, result, paper_index, gap_index)
+        graph_col, details_col = st.columns([6, 4])
+        with graph_col:
+            with st.container(border=True):
+                st.caption("Papers = P1, P2… · Gaps = G1, G2… · Hover any node for full text · Click to inspect · Claim/method/gap nodes can be expanded")
+                clicked = _render_graph_interactive(g, st.session_state.annotations, paper_index, gap_index)
+                if clicked:
+                    st.session_state.selected_node = clicked
+        with details_col:
+            st.markdown("**Node details**")
+            sel = st.session_state.selected_node
+            if sel:
+                _render_node_inspector(sel, g, result, paper_index, gap_index)
+            else:
+                st.info("Click a node in the graph to inspect details.")
 
         # Paper index table
         if paper_index:
