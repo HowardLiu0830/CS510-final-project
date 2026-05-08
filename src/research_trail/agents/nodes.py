@@ -23,14 +23,14 @@ class _SubProblems(BaseModel):
 
 
 _SCOPE_PROMPT = """You are a research strategist. Decompose the user's query
-into 3-5 concrete sub-problems that, taken together, would produce a
+into EXACTLY 3 concrete sub-problems that, taken together, would produce a
 well-rounded literature survey. Each sub-problem should be a short noun
 phrase or question that could itself be searched against an academic index.
 
 User query:
 {query}
 
-Return JSON with one field: sub_problems (a list of 3-5 strings).
+Return JSON with one field: sub_problems (a list of exactly 3 strings).
 """
 
 
