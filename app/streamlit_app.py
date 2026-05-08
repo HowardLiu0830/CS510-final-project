@@ -9,6 +9,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from typing import Any
 
 import streamlit as st
@@ -22,7 +23,14 @@ from research_trail.agents.nodes import (
     synthesize as node_synthesize,
 )
 from research_trail.config import PROJECT_ROOT, get_settings
-from research_trail.runlog import get_current_handler, open_run, serialize_state, write_state
+from research_trail.runlog import (
+    _current_handler,
+    _current_node,
+    get_current_handler,
+    open_run,
+    serialize_state,
+    write_state,
+)
 
 st.set_page_config(page_title="Research Trail Builder", layout="wide")
 st.title("Research Trail Builder")
@@ -34,9 +42,31 @@ for _key, _default in [
     ("annotations", {}),
     ("selected_node", None),
     ("eval_result", None),
+    ("llm_handler", None),
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
+
+
+@contextmanager
+def _attribute_to(node_name: str):
+    """Bind the active run's LLM callback handler and node name for post-run actions.
+
+    During the pipeline run the @node decorator + open_run set these contextvars,
+    but Streamlit buttons (Evaluate, Expand topic) fire on later script reruns
+    after open_run has exited, so without this re-bind their LLM calls would
+    have no callback attached at all — token/cost would silently disappear.
+    The handler is the same instance the run created, fetched from session_state.
+    """
+    handler = st.session_state.get("llm_handler")
+    h_tok = _current_handler.set(handler) if handler is not None else None
+    n_tok = _current_node.set(node_name)
+    try:
+        yield handler
+    finally:
+        _current_node.reset(n_tok)
+        if h_tok is not None:
+            _current_handler.reset(h_tok)
 
 settings = get_settings()
 if settings.offline:
@@ -216,8 +246,16 @@ def _expand_node(concept_label: str, result: dict) -> None:
             return
 
         workers = min(settings.extract_concurrency, len(fresh))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            new_extractions = list(pool.map(extract_from_paper, fresh))
+        # Re-bind the run's LLM handler + node name so extractions kicked off
+        # by this button still land in messages.jsonl and the cost accumulator.
+        with _attribute_to("expand_topic"):
+            ctx = contextvars.copy_context()
+
+            def _run(paper):
+                return ctx.run(extract_from_paper, paper)
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                new_extractions = list(pool.map(_run, fresh))
 
         result["papers"] = result.get("papers", []) + fresh
         all_extractions = result.get("extractions", []) + new_extractions
@@ -426,8 +464,11 @@ def _extract_with_progress(papers: list) -> list:
     """Run per-paper extraction concurrently with a live progress bar.
 
     Bypasses screen_and_extract's internal pool so the UI can surface
-    per-paper completions instead of one long opaque spinner. Order is
-    preserved: ``extractions[i]`` corresponds to ``papers[i]``.
+    per-paper completions. Order is preserved: ``extractions[i]`` corresponds
+    to ``papers[i]``. The node-name contextvar is set explicitly here (since
+    we skip the @node wrapper) and copy_context is used so worker threads
+    see the same value — without this, every per-paper LLM call would log
+    with node=None and the screen_and_extract step expander would show $0.
     """
     from research_trail.extraction.extractor import extract_from_paper
 
@@ -435,15 +476,28 @@ def _extract_with_progress(papers: list) -> list:
     workers = min(get_settings().extract_concurrency, n)
     extractions: list = [None] * n
     bar = st.progress(0.0, text=f"Extracting 0/{n} papers…")
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        future_to_idx = {pool.submit(extract_from_paper, p): i for i, p in enumerate(papers)}
-        done = 0
-        for fut in as_completed(future_to_idx):
-            idx = future_to_idx[fut]
-            extractions[idx] = fut.result()
-            done += 1
-            paper_title = papers[idx].title[:50]
-            bar.progress(done / n, text=f"Extracting {done}/{n} · just finished: {paper_title}…")
+
+    n_tok = _current_node.set("screen_and_extract")
+    try:
+        ctx = contextvars.copy_context()
+
+        def _run(paper):
+            return ctx.run(extract_from_paper, paper)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_idx = {pool.submit(_run, p): i for i, p in enumerate(papers)}
+            done = 0
+            for fut in as_completed(future_to_idx):
+                idx = future_to_idx[fut]
+                extractions[idx] = fut.result()
+                done += 1
+                paper_title = papers[idx].title[:50]
+                bar.progress(
+                    done / n,
+                    text=f"Extracting {done}/{n} · just finished: {paper_title}…",
+                )
+    finally:
+        _current_node.reset(n_tok)
     bar.empty()
     return extractions
 
@@ -480,9 +534,11 @@ if run and query:
             status.update(label="Pipeline complete", state="complete", expanded=False)
 
         run_elapsed = time.perf_counter() - pipeline_t0
-        # Final cost banner — read totals before open_run exits and clears the contextvar.
-        handler = get_current_handler()
-        run_totals = handler.totals() if handler else None
+        # Stash the handler + elapsed time in session_state so post-run buttons
+        # (Evaluate, Expand topic) can re-bind it via _attribute_to and keep
+        # accumulating, and so the cost banner re-renders on every script rerun.
+        st.session_state.llm_handler = get_current_handler()
+        st.session_state.run_elapsed = run_elapsed
 
         write_state(run_dir, serialize_state(query, state_view))
         try:
@@ -491,16 +547,30 @@ if run and query:
             rel = run_dir
         st.caption(f"Artifacts saved to `{rel}`")
 
-    if run_totals is not None:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total tokens", f"{run_totals['total_tokens']:,}")
-        c2.metric(
-            "Total cost",
-            _format_cost(run_totals["cost_usd"], run_totals.get("cost_unknown_model", False)),
-        )
-        c3.metric("Pipeline time", f"{run_elapsed:.1f}s")
-
     st.session_state.result = state_view
+
+
+def _render_cost_banner() -> None:
+    """Render the tokens/cost/time banner from the live handler.
+
+    Shown on every rerun (not just immediately after the pipeline) so post-run
+    LLM calls — Evaluate, Expand topic — surface their additional cost as the
+    user clicks. Reads totals fresh each time so the banner stays current.
+    """
+    handler = st.session_state.get("llm_handler")
+    if handler is None:
+        return
+    totals = handler.totals()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total tokens", f"{totals['total_tokens']:,}")
+    c2.metric(
+        "Total cost",
+        _format_cost(totals["cost_usd"], totals.get("cost_unknown_model", False)),
+    )
+    c3.metric("Pipeline time", f"{st.session_state.get('run_elapsed', 0):.1f}s")
+
+
+_render_cost_banner()
 
 # ── results rendering ─────────────────────────────────────────────────────────
 result = st.session_state.get("result")
@@ -527,7 +597,7 @@ if result:
         if st.button("Evaluate with LLM judge"):
             from research_trail.evaluation.llm_judge import judge
 
-            with st.spinner("Running LLM judge…"):
+            with st.spinner("Running LLM judge…"), _attribute_to("evaluate"):
                 g_ref = result.get("graph", {})
                 rubric = judge(
                     result.get("query", query),
