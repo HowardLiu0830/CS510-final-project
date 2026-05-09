@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -72,6 +73,28 @@ def _build_gap_index(g: dict) -> dict[str, tuple[int, str]]:
             n += 1
             index[node["id"]] = (n, node.get("label", node["id"]))
     return index
+
+
+def _annotate_summary_with_paper_refs(summary: str, paper_index: dict[str, tuple[int, Any]]) -> str:
+    """Append clickable [P#] references after paper titles in synthesis text."""
+    if not summary or not paper_index:
+        return summary
+
+    title_refs = sorted(
+        (
+            (paper.title, idx, getattr(paper, "url", ""))
+            for idx, paper in paper_index.values()
+            if getattr(paper, "title", "")
+        ),
+        key=lambda x: len(x[0]),
+        reverse=True,
+    )
+    annotated = summary
+    for title, idx, url in title_refs:
+        pattern = re.compile(rf"{re.escape(title)}(?!\s*\[P\d+\])")
+        ref = f"[\\[P{idx}\\]]({url})" if url else f"\\[P{idx}\\]"
+        annotated = pattern.sub(lambda m: f"{m.group(0)} {ref}", annotated)
+    return annotated
 
 
 def _render_graph_interactive(
@@ -289,10 +312,15 @@ if run and query:
 # ── results rendering ─────────────────────────────────────────────────────────
 result = st.session_state.get("result")
 if result:
+    papers = result.get("papers", [])
+    g = result.get("graph", {})
+    paper_index = _build_paper_index(g, papers) if g else {}
+    gap_index = _build_gap_index(g) if g else {}
+
     summary = result.get("summary", "")
     if summary:
         st.subheader("Synthesis")
-        st.write(summary)
+        st.markdown(_annotate_summary_with_paper_refs(summary, paper_index))
 
     gaps = result.get("gaps", [])
     if gaps:
@@ -342,11 +370,6 @@ if result:
         if score.rationale:
             st.caption(f"Judge rationale: {score.rationale}")
 
-    papers = result.get("papers", [])
-    g = result.get("graph", {})
-    paper_index = _build_paper_index(g, papers) if g else {}
-    gap_index = _build_gap_index(g) if g else {}
-
     if g and g.get("nodes"):
         st.subheader("Concept Graph")
 
@@ -365,53 +388,65 @@ if result:
                 unsafe_allow_html=True,
             )
 
-        st.caption("Papers = P1, P2… · Gaps = G1, G2… · Single-click to inspect · Double-click a paper to open it · Claim/method/gap nodes can be expanded")
-        clicked = _render_graph_interactive(g, st.session_state.annotations, paper_index, gap_index)
-        if clicked:
-            st.session_state.selected_node = clicked
-
-        sel = st.session_state.selected_node
-        if sel:
-            _render_node_inspector(sel, g, result, paper_index, gap_index)
+        graph_col, details_col = st.columns([6, 4])
+        with graph_col:
+            with st.container(border=True):
+                st.caption("Papers = P1, P2… · Gaps = G1, G2… · Hover any node for full text · Click to inspect · Claim/method/gap nodes can be expanded")
+                clicked = _render_graph_interactive(g, st.session_state.annotations, paper_index, gap_index)
+                if clicked:
+                    st.session_state.selected_node = clicked
+        with details_col:
+            st.markdown("**Node details**")
+            sel = st.session_state.selected_node
+            if sel:
+                _render_node_inspector(sel, g, result, paper_index, gap_index)
+            else:
+                st.info("Click a node in the graph to inspect details.")
 
         # Paper index table
-        if paper_index:
-            st.markdown("**Paper index**")
-            for nid, (idx, paper) in sorted(paper_index.items(), key=lambda x: x[1][0]):
-                link = f"[{paper.title}]({paper.url})" if paper.url else paper.title
-                authors = ", ".join(paper.authors[:2]) + (" et al." if len(paper.authors) > 2 else "")
-                st.markdown(f"**P{idx}** · {link} · {authors} · {paper.year or 'n/a'} · `{paper.source}`")
+        # if paper_index:
+        #     st.markdown("**Paper index**")
+        #     for nid, (idx, paper) in sorted(paper_index.items(), key=lambda x: x[1][0]):
+        #         link = f"[{paper.title}]({paper.url})" if paper.url else paper.title
+        #         authors = ", ".join(paper.authors[:2]) + (" et al." if len(paper.authors) > 2 else "")
+        #         st.markdown(f"**P{idx}** · {link} · {authors} · {paper.year or 'n/a'} · `{paper.source}`")
 
         # Gap index table
         if gap_index:
-            st.markdown("**Gap index**")
+            st.subheader("Gap index")
             for nid, (idx, gap_text) in sorted(gap_index.items(), key=lambda x: x[1][0]):
                 st.markdown(f"**G{idx}** · {gap_text}")
 
-    # Papers + Extractions tabs
-    tab_papers, tab_extractions = st.tabs(["Papers", "Extractions"])
-    with tab_papers:
-        if papers:
-            source_counts = Counter(p.source for p in papers)
-            src_cols = st.columns(len(source_counts))
-            for col, (src, cnt) in zip(src_cols, sorted(source_counts.items())):
-                col.metric(src, cnt)
-            st.divider()
-            for p in papers:
-                title_md = f"[{p.title}]({p.url})" if p.url else p.title
+    
+    st.subheader("Paper Index and Extractions")
+    # Merged Papers + Extractions view
+    extractions = result.get("extractions", [])
+    if not papers:
+        st.info("No papers retrieved.")
+    elif not extractions:
+        st.info("No extractions available.")
+    else:
+        # Build a mapping from paper id to (index, Paper object)
+        paper_display_index = {p.id: (idx, p) for idx, (nid, (idx, p)) in enumerate(sorted(paper_index.items(), key=lambda x: x[1][0]), 1)}
+        # Map paper_id → first extraction (by order in extractions)
+        paper_to_extraction = {}
+        for ext in extractions:
+            paper_to_extraction.setdefault(ext.paper_id, ext)
+        for nid, (idx, paper) in sorted(paper_index.items(), key=lambda x: x[1][0]):
+            ext = paper_to_extraction.get(paper.id)
+            reference = f"**[P{idx}]**"
+            title_md = paper.title
+            conf_pct = f"{ext.confidence * 100:.0f}%" if ext and hasattr(ext, "confidence") else "n/a"
+            expander_label = f"{reference} {paper.title}  (confidence: {conf_pct})"
+            with st.expander(expander_label):
                 st.markdown(
-                    f"**{title_md}** · {', '.join(p.authors[:3])} · "
-                    f"{p.year or 'n/a'} · `{p.source}`"
+                    f"**URL**: {paper.url}<br>"
+                    f"**Authors**: {', '.join(paper.authors[:3])}{' et al.' if len(paper.authors) > 3 else ''}<br>"
+                    f"**Year**: {paper.year or 'n/a'} &nbsp; | &nbsp; **Source**: `{paper.source}`",
+                    unsafe_allow_html=True,
                 )
-        else:
-            st.info("No papers retrieved.")
-
-    with tab_extractions:
-        extractions = result.get("extractions", [])
-        if extractions:
-            for ext in extractions:
-                conf_pct = f"{ext.confidence * 100:.0f}%"
-                with st.expander(f"{ext.paper_id}  (confidence: {conf_pct})"):
+           
+                if ext:
                     if ext.claims:
                         st.markdown("**Claims:**")
                         for c in ext.claims:
@@ -424,5 +459,5 @@ if result:
                         st.markdown("**Evidence:**")
                         for e in ext.evidence:
                             st.markdown(f"- {e}")
-        else:
-            st.info("No extractions available.")
+                else:
+                    st.info("No extraction available for this paper.")
