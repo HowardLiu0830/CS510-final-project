@@ -2,18 +2,35 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import re
+import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from typing import Any
 
 import streamlit as st
 
-from research_trail.agents.graph import compile_graph
+from research_trail.agents.nodes import (
+    build_graph as node_build_graph,
+    identify_gaps as node_identify_gaps,
+    scope_query as node_scope_query,
+    screen_and_extract as node_screen_and_extract,
+    search_papers as node_search_papers,
+    synthesize as node_synthesize,
+)
 from research_trail.config import PROJECT_ROOT, get_settings
-from research_trail.runlog import open_run, serialize_state, write_state
+from research_trail.runlog import (
+    _current_handler,
+    _current_node,
+    get_current_handler,
+    open_run,
+    serialize_state,
+    write_state,
+)
 
 st.set_page_config(page_title="Research Trail Builder", layout="wide")
 st.title("Research Trail Builder")
@@ -25,9 +42,31 @@ for _key, _default in [
     ("annotations", {}),
     ("selected_node", None),
     ("eval_result", None),
+    ("llm_handler", None),
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
+
+
+@contextmanager
+def _attribute_to(node_name: str):
+    """Bind the active run's LLM callback handler and node name for post-run actions.
+
+    During the pipeline run the @node decorator + open_run set these contextvars,
+    but Streamlit buttons (Evaluate, Expand topic) fire on later script reruns
+    after open_run has exited, so without this re-bind their LLM calls would
+    have no callback attached at all — token/cost would silently disappear.
+    The handler is the same instance the run created, fetched from session_state.
+    """
+    handler = st.session_state.get("llm_handler")
+    h_tok = _current_handler.set(handler) if handler is not None else None
+    n_tok = _current_node.set(node_name)
+    try:
+        yield handler
+    finally:
+        _current_node.reset(n_tok)
+        if h_tok is not None:
+            _current_handler.reset(h_tok)
 
 settings = get_settings()
 if settings.offline:
@@ -207,8 +246,16 @@ def _expand_node(concept_label: str, result: dict) -> None:
             return
 
         workers = min(settings.extract_concurrency, len(fresh))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            new_extractions = list(pool.map(extract_from_paper, fresh))
+        # Re-bind the run's LLM handler + node name so extractions kicked off
+        # by this button still land in messages.jsonl and the cost accumulator.
+        with _attribute_to("expand_topic"):
+            ctx = contextvars.copy_context()
+
+            def _run(paper):
+                return ctx.run(extract_from_paper, paper)
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                new_extractions = list(pool.map(_run, fresh))
 
         result["papers"] = result.get("papers", []) + fresh
         all_extractions = result.get("extractions", []) + new_extractions
@@ -280,25 +327,218 @@ def _render_node_inspector(
 
 
 # ── pipeline execution ────────────────────────────────────────────────────────
+def _render_step_details(name: str, state: dict) -> None:
+    """Render verbose per-step detail inside the step's expander body."""
+    if name == "scope_query":
+        for i, s in enumerate(state.get("sub_problems", []), 1):
+            st.markdown(f"{i}. {s}")
+
+    elif name == "search_papers":
+        papers = state.get("papers", [])
+        if papers:
+            src = Counter(p.source for p in papers)
+            st.caption(" · ".join(f"**{s}**: {c}" for s, c in sorted(src.items())))
+        for p in papers:
+            title = f"[{p.title}]({p.url})" if p.url else p.title
+            authors = ", ".join(p.authors[:2]) + (" et al." if len(p.authors) > 2 else "")
+            st.markdown(f"- {title}  *({authors}, {p.year or 'n/a'}, `{p.source}`)*")
+
+    elif name == "screen_and_extract":
+        for ext in state.get("extractions", []):
+            st.markdown(
+                f"**{ext.paper_id}** · conf {ext.confidence:.2f} · "
+                f"{len(ext.claims)} claims · {len(ext.methods)} methods · "
+                f"{len(ext.evidence)} evidence"
+            )
+
+    elif name == "build_graph":
+        g = state.get("graph", {})
+        nodes = g.get("nodes", [])
+        kinds = Counter(n.get("kind") for n in nodes)
+        st.caption(" · ".join(f"**{k}**: {v}" for k, v in sorted(kinds.items())))
+
+    elif name == "synthesize":
+        summary = state.get("summary", "") or "(empty)"
+        st.write(summary)
+
+    elif name == "identify_gaps":
+        for i, gap in enumerate(state.get("gaps", []), 1):
+            st.markdown(f"{i}. {gap}")
+
+
+def _step_summary(name: str, state: dict) -> str:
+    if name == "scope_query":
+        return f"{len(state.get('sub_problems', []))} sub-problems"
+    if name == "search_papers":
+        return f"{len(state.get('papers', []))} papers"
+    if name == "screen_and_extract":
+        return f"{len(state.get('extractions', []))} extractions"
+    if name == "build_graph":
+        g = state.get("graph", {})
+        return f"{len(g.get('nodes', []))} nodes, {len(g.get('edges', []))} edges"
+    if name == "synthesize":
+        return f"{len((state.get('summary') or '').split())} words"
+    if name == "identify_gaps":
+        return f"{len(state.get('gaps', []))} gaps"
+    return ""
+
+
+def _format_cost(cost: float, unknown: bool) -> str:
+    if unknown:
+        return "$? (model untracked)"
+    return f"${cost:.4f}"
+
+
+def _node_usage(name: str) -> dict | None:
+    """Look up tokens/cost for a node from the active runlog handler."""
+    handler = get_current_handler()
+    if handler is None:
+        return None
+    return handler.totals_by_node().get(name)
+
+
+def _render_step(name: str, elapsed: float, state: dict) -> None:
+    summary = _step_summary(name, state)
+    usage = _node_usage(name)
+    cost_part = ""
+    if usage:
+        cost_part = (
+            f" · {usage['total_tokens']:,} tok · "
+            f"{_format_cost(usage['cost_usd'], False)}"
+        )
+    label = f"✓ `{name}` ({elapsed:.1f}s{cost_part}) — {summary}"
+    with st.expander(label, expanded=False):
+        if usage:
+            st.caption(
+                f"**{usage['calls']} call(s)** · "
+                f"prompt: {usage['prompt_tokens']:,} tok · "
+                f"completion: {usage['completion_tokens']:,} tok · "
+                f"cost: {_format_cost(usage['cost_usd'], False)}"
+            )
+        _render_step_details(name, state)
+
+
+def _run_node_with_timer(name: str, fn, state: dict) -> float:
+    """Run a node in a worker thread while ticking a live elapsed-time line.
+
+    runlog uses contextvars for the per-run logging handler and current node
+    name, so we hand the worker thread a copy of the current context — a
+    plain ``Thread(target=fn)`` would lose that and silently skip log lines.
+    The line also surfaces tokens/cost for the active node so the user can
+    see spend accumulate in real time once the LLM call returns.
+    """
+    t0 = time.perf_counter()
+    placeholder = st.empty()
+    result_box: dict[str, Any] = {}
+    ctx = contextvars.copy_context()
+
+    def _runner() -> None:
+        try:
+            partial = fn(state)
+            result_box["partial"] = partial if isinstance(partial, dict) else {}
+        except Exception as exc:  # surfaced after join so the UI stays consistent
+            result_box["error"] = exc
+
+    th = threading.Thread(target=ctx.run, args=(_runner,), daemon=True)
+    th.start()
+    while th.is_alive():
+        elapsed = time.perf_counter() - t0
+        usage = _node_usage(name)
+        suffix = ""
+        if usage and usage["total_tokens"]:
+            suffix = (
+                f" · {usage['total_tokens']:,} tok · "
+                f"{_format_cost(usage['cost_usd'], False)}"
+            )
+        placeholder.markdown(f"⏳ `{name}` _running… {elapsed:.1f}s{suffix}_")
+        time.sleep(0.2)
+    th.join()
+    placeholder.empty()
+    if "error" in result_box:
+        raise result_box["error"]
+    state.update(result_box.get("partial", {}))
+    return time.perf_counter() - t0
+
+
+def _extract_with_progress(papers: list) -> list:
+    """Run per-paper extraction concurrently with a live progress bar.
+
+    Bypasses screen_and_extract's internal pool so the UI can surface
+    per-paper completions. Order is preserved: ``extractions[i]`` corresponds
+    to ``papers[i]``. The node-name contextvar is set explicitly here (since
+    we skip the @node wrapper) and copy_context is used so worker threads
+    see the same value — without this, every per-paper LLM call would log
+    with node=None and the screen_and_extract step expander would show $0.
+    """
+    from research_trail.extraction.extractor import extract_from_paper
+
+    n = len(papers)
+    workers = min(get_settings().extract_concurrency, n)
+    extractions: list = [None] * n
+    bar = st.progress(0.0, text=f"Extracting 0/{n} papers…")
+
+    n_tok = _current_node.set("screen_and_extract")
+    try:
+        ctx = contextvars.copy_context()
+
+        def _run(paper):
+            return ctx.run(extract_from_paper, paper)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_idx = {pool.submit(_run, p): i for i, p in enumerate(papers)}
+            done = 0
+            for fut in as_completed(future_to_idx):
+                idx = future_to_idx[fut]
+                extractions[idx] = fut.result()
+                done += 1
+                paper_title = papers[idx].title[:50]
+                bar.progress(
+                    done / n,
+                    text=f"Extracting {done}/{n} · just finished: {paper_title}…",
+                )
+    finally:
+        _current_node.reset(n_tok)
+    bar.empty()
+    return extractions
+
+
 if run and query:
     st.session_state.result = None
     st.session_state.selected_node = None
     st.session_state.eval_result = None
 
+    pipeline_t0 = time.perf_counter()
     with open_run(query) as run_dir:
         with st.status("Running pipeline…", expanded=True) as status:
-            pipeline = compile_graph()
-            state_view: dict = {}
-            t0 = time.perf_counter()
-            for update in pipeline.stream({"query": query}):
-                for node_name, partial in update.items():
-                    if not isinstance(partial, dict):
-                        continue
-                    state_view.update(partial)
-                    dt = time.perf_counter() - t0
-                    status.write(f"✓ `{node_name}` ({dt:.1f}s)")
-                    t0 = time.perf_counter()
+            state_view: dict = {"query": query}
+
+            def _step(name: str, fn) -> None:
+                elapsed = _run_node_with_timer(name, fn, state_view)
+                _render_step(name, elapsed, state_view)
+
+            _step("scope_query", node_scope_query)
+            _step("search_papers", node_search_papers)
+
+            papers = state_view.get("papers", [])
+            if get_settings().offline or not papers:
+                _step("screen_and_extract", node_screen_and_extract)
+            else:
+                t0 = time.perf_counter()
+                state_view["extractions"] = _extract_with_progress(papers)
+                _render_step("screen_and_extract", time.perf_counter() - t0, state_view)
+
+            _step("build_graph", node_build_graph)
+            _step("synthesize", node_synthesize)
+            _step("identify_gaps", node_identify_gaps)
+
             status.update(label="Pipeline complete", state="complete", expanded=False)
+
+        run_elapsed = time.perf_counter() - pipeline_t0
+        # Stash the handler + elapsed time in session_state so post-run buttons
+        # (Evaluate, Expand topic) can re-bind it via _attribute_to and keep
+        # accumulating, and so the cost banner re-renders on every script rerun.
+        st.session_state.llm_handler = get_current_handler()
+        st.session_state.run_elapsed = run_elapsed
 
         write_state(run_dir, serialize_state(query, state_view))
         try:
@@ -308,6 +548,29 @@ if run and query:
         st.caption(f"Artifacts saved to `{rel}`")
 
     st.session_state.result = state_view
+
+
+def _render_cost_banner() -> None:
+    """Render the tokens/cost/time banner from the live handler.
+
+    Shown on every rerun (not just immediately after the pipeline) so post-run
+    LLM calls — Evaluate, Expand topic — surface their additional cost as the
+    user clicks. Reads totals fresh each time so the banner stays current.
+    """
+    handler = st.session_state.get("llm_handler")
+    if handler is None:
+        return
+    totals = handler.totals()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total tokens", f"{totals['total_tokens']:,}")
+    c2.metric(
+        "Total cost",
+        _format_cost(totals["cost_usd"], totals.get("cost_unknown_model", False)),
+    )
+    c3.metric("Pipeline time", f"{st.session_state.get('run_elapsed', 0):.1f}s")
+
+
+_render_cost_banner()
 
 # ── results rendering ─────────────────────────────────────────────────────────
 result = st.session_state.get("result")
@@ -334,7 +597,7 @@ if result:
         if st.button("Evaluate with LLM judge"):
             from research_trail.evaluation.llm_judge import judge
 
-            with st.spinner("Running LLM judge…"):
+            with st.spinner("Running LLM judge…"), _attribute_to("evaluate"):
                 g_ref = result.get("graph", {})
                 rubric = judge(
                     result.get("query", query),
