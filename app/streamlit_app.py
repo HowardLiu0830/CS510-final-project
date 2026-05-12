@@ -407,7 +407,8 @@ def _render_step(name: str, elapsed: float, state: dict) -> None:
             f"{_format_cost(usage['cost_usd'], False)}"
         )
     label = f"✓ `{name}` ({elapsed:.1f}s{cost_part}) — {summary}"
-    with st.expander(label, expanded=False):
+    st.markdown(label)
+    with st.container(border=True):
         if usage:
             st.caption(
                 f"**{usage['calls']} call(s)** · "
