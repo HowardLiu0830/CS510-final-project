@@ -249,13 +249,14 @@ def _expand_node(concept_label: str, result: dict) -> None:
         # Re-bind the run's LLM handler + node name so extractions kicked off
         # by this button still land in messages.jsonl and the cost accumulator.
         with _attribute_to("expand_topic"):
-            ctx = contextvars.copy_context()
-
-            def _run(paper):
+            def _run(paper: Any, ctx: contextvars.Context) -> Any:
                 return ctx.run(extract_from_paper, paper)
 
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                new_extractions = list(pool.map(_run, fresh))
+                new_extractions = list(pool.map(
+                    lambda args: _run(*args),
+                    [(p, contextvars.copy_context()) for p in fresh],
+                ))
 
         result["papers"] = result.get("papers", []) + fresh
         all_extractions = result.get("extractions", []) + new_extractions
@@ -323,6 +324,11 @@ def _render_node_inspector(
                 label = node_meta.get("label", node_id)
                 if st.button("Expand topic", key=f"expand_{node_id}", type="primary"):
                     _expand_node(label, st.session_state.result)
+                    st.rerun()
+            elif kind == "paper" and node_id in paper_index:
+                _, paper = paper_index[node_id]
+                if st.button("Expand topic", key=f"expand_{node_id}", type="primary"):
+                    _expand_node(paper.title, st.session_state.result)
                     st.rerun()
 
 
@@ -407,7 +413,8 @@ def _render_step(name: str, elapsed: float, state: dict) -> None:
             f"{_format_cost(usage['cost_usd'], False)}"
         )
     label = f"✓ `{name}` ({elapsed:.1f}s{cost_part}) — {summary}"
-    with st.expander(label, expanded=False):
+    st.markdown(label)
+    with st.container(border=True):
         if usage:
             st.caption(
                 f"**{usage['calls']} call(s)** · "
@@ -479,13 +486,19 @@ def _extract_with_progress(papers: list) -> list:
 
     n_tok = _current_node.set("screen_and_extract")
     try:
-        ctx = contextvars.copy_context()
-
-        def _run(paper):
+        # Each worker needs its own Context copy: a single shared ctx object can
+        # only be entered by one thread at a time, so concurrent ctx.run() calls
+        # on the same object race and crash. Copying once per paper in the main
+        # thread (where _current_node is already set) gives each worker an
+        # independent context with the correct node name.
+        def _run(paper: Any, ctx: contextvars.Context) -> Any:
             return ctx.run(extract_from_paper, paper)
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            future_to_idx = {pool.submit(_run, p): i for i, p in enumerate(papers)}
+            future_to_idx = {
+                pool.submit(_run, p, contextvars.copy_context()): i
+                for i, p in enumerate(papers)
+            }
             done = 0
             for fut in as_completed(future_to_idx):
                 idx = future_to_idx[fut]
