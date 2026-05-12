@@ -23,14 +23,14 @@ class _SubProblems(BaseModel):
 
 
 _SCOPE_PROMPT = """You are a research strategist. Decompose the user's query
-into EXACTLY 3 concrete sub-problems that, taken together, would produce a
+into EXACTLY {n} concrete sub-problem(s) that, taken together, would produce a
 well-rounded literature survey. Each sub-problem should be a short noun
 phrase or question that could itself be searched against an academic index.
 
 User query:
 {query}
 
-Return JSON with one field: sub_problems (a list of exactly 3 strings).
+Return JSON with one field: sub_problems (a list of exactly {n} string(s)).
 """
 
 
@@ -38,16 +38,18 @@ Return JSON with one field: sub_problems (a list of exactly 3 strings).
 def scope_query(state: dict) -> dict:
     """Decompose the query into sub-problems."""
     query = state.get("query", "")
-    if get_settings().offline:
-        return {"sub_problems": [f"sub-problem: {query} (stub)"]}
+    settings = get_settings()
+    n = settings.n_sub_problems
+    if settings.offline:
+        return {"sub_problems": [f"sub-problem {i+1}: {query} (stub)" for i in range(n)]}
 
     model = get_chat_model()
     if model is None:
         return {"sub_problems": [query]}
     try:
         structured = model.with_structured_output(_SubProblems)
-        out: _SubProblems = structured.invoke(_SCOPE_PROMPT.format(query=query))
-        subs = [s.strip() for s in out.sub_problems if s and s.strip()]
+        out: _SubProblems = structured.invoke(_SCOPE_PROMPT.format(query=query, n=n))
+        subs = [s.strip() for s in out.sub_problems if s and s.strip()][:n]
         return {"sub_problems": subs or [query]}
     except Exception:
         return {"sub_problems": [query]}
@@ -83,9 +85,16 @@ def search_papers(state: dict) -> dict:
     from research_trail.search.aggregator import search_all
 
     # Search the main query and each sub-problem in parallel, then deduplicate.
-    queries = list(dict.fromkeys([query] + sub_problems))[:6]  # cap total searches
+    # Cap = 1 + n_sub_problems (matches scope_query's contract).
+    settings = get_settings()
+    cap = 1 + settings.n_sub_problems
+    year_max = settings.retrieval_year_max
+    queries = list(dict.fromkeys([query] + sub_problems))[:cap]
     with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-        results_per_query = list(pool.map(lambda q: search_all(q, per_source_limit=3), queries))
+        results_per_query = list(pool.map(
+            lambda q: search_all(q, per_source_limit=3, year_max=year_max),
+            queries,
+        ))
 
     seen_keys: set[str] = set()
     all_papers: list[Paper] = []

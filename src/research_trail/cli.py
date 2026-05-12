@@ -28,6 +28,16 @@ def run_agent(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the research-trail agent.")
     parser.add_argument("query", help="Research query / topic")
     parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help=(
+            "Override the generation model for this run "
+            "(e.g. 'moonshotai/kimi-k2.6', 'google/gemini-3-flash-preview'). "
+            "Does NOT affect the judge model, which still reads OPENAI_MODEL."
+        ),
+    )
+    parser.add_argument(
         "--out", type=Path, default=None, help="Optional path to write a single JSON result"
     )
     parser.add_argument(
@@ -44,19 +54,26 @@ def run_agent(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from research_trail.agents.graph import compile_graph
+    from research_trail.llm.client import override_model
     from research_trail.runlog import open_run, serialize_state, write_state
 
     graph = compile_graph()
+    # Tag the query so model-conditioned runs are distinguishable in eval.
+    tagged_query = f"[model:{args.model}] {args.query}" if args.model else args.query
 
+    # override_model must wrap open_run so _write_meta (in open_run's
+    # finally) still sees the override when it records the effective model.
     if args.no_run_dir:
-        state = graph.invoke({"query": args.query})
-        serial = serialize_state(args.query, state)
+        with override_model(args.model):
+            state = graph.invoke({"query": args.query})
+            serial = serialize_state(tagged_query, state)
         run_dir_used: Path | None = None
     else:
-        with open_run(args.query, run_dir=args.run_dir) as run_dir_used:
-            state = graph.invoke({"query": args.query})
-            serial = serialize_state(args.query, state)
-            write_state(run_dir_used, serial)
+        with override_model(args.model):
+            with open_run(tagged_query, run_dir=args.run_dir) as run_dir_used:
+                state = graph.invoke({"query": args.query})
+                serial = serialize_state(tagged_query, state)
+                write_state(run_dir_used, serial)
 
     text = json.dumps(serial, indent=2, default=str)
     print(text)
@@ -72,6 +89,76 @@ def run_agent(argv: list[str] | None = None) -> int:
         for msg in issues:
             print(f"  - {msg}", file=sys.stderr)
         return 1
+    return 0
+
+
+def run_baseline(argv: list[str] | None = None) -> int:
+    """Run one of the evaluation baselines and persist its output like a normal run.
+
+    The output schema matches the main pipeline so ``runs_to_jsonl`` + ``run_eval``
+    consume baseline runs unchanged.
+    """
+    parser = argparse.ArgumentParser(description="Run an evaluation baseline.")
+    parser.add_argument(
+        "--kind",
+        choices=["zero_shot", "no_graph"],
+        required=True,
+        help="Which baseline to run.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help=(
+            "Override the generation model for this baseline run. "
+            "Judge model is unaffected."
+        ),
+    )
+    parser.add_argument("query", help="Research query / topic")
+    parser.add_argument(
+        "--out", type=Path, default=None, help="Optional path to write a single JSON result"
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Override the auto-created per-run directory.",
+    )
+    parser.add_argument(
+        "--no-run-dir",
+        action="store_true",
+        help="Disable per-run persistence (no log/state files written)",
+    )
+    args = parser.parse_args(argv)
+
+    from research_trail.baselines import run_no_graph, run_zero_shot
+    from research_trail.llm.client import override_model
+    from research_trail.runlog import open_run, serialize_state, write_state
+
+    runner = run_zero_shot if args.kind == "zero_shot" else run_no_graph
+    # Tag the run dir so eval can distinguish baseline runs from full-pipeline runs,
+    # and also pin the generation model so model-conditioned ablations are visible.
+    model_tag = f"[model:{args.model}] " if args.model else ""
+    tagged_query = f"[baseline:{args.kind}] {model_tag}{args.query}"
+
+    # override_model wraps open_run so _write_meta sees the override.
+    if args.no_run_dir:
+        with override_model(args.model):
+            serial = serialize_state(tagged_query, runner(args.query))
+        run_dir_used: Path | None = None
+    else:
+        with override_model(args.model):
+            with open_run(tagged_query, run_dir=args.run_dir) as run_dir_used:
+                serial = serialize_state(tagged_query, runner(args.query))
+                write_state(run_dir_used, serial)
+
+    text = json.dumps(serial, indent=2, default=str)
+    print(text)
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(text)
+    if run_dir_used is not None:
+        print(f"\n# run artifacts: {run_dir_used}", file=sys.stderr)
     return 0
 
 

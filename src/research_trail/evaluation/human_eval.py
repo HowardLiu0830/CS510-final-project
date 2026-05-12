@@ -13,17 +13,23 @@ from research_trail.evaluation.rubric import Rubric
 
 
 def write_form_template(query: str, system_output: dict, out_path: Path) -> Path:
+    from research_trail.evaluation.rubric import DIMENSIONS, LEVEL_ANCHORS
+
+    score: dict = {}
+    # Inline the anchored 1/3/5 definitions next to each dimension so a human
+    # reviewer grades against the same rubric the LLM judge uses.
+    for dim in DIMENSIONS:
+        anchors = LEVEL_ANCHORS[dim]
+        score[f"_{dim}_anchors"] = {str(k): v for k, v in anchors.items()}
+        score[dim] = 0  # fill in 1-5
+        score[f"{dim}_note"] = ""  # one-sentence justification
+    score["rationale"] = ""  # overall comment
+
     template = {
         "judge_id": "human:<netid>",
         "query": query,
         "system_output": system_output,
-        "score": {
-            "relevance": 0,
-            "coverage": 0,
-            "structural_organization": 0,
-            "insightfulness": 0,
-            "rationale": "",
-        },
+        "score": score,
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(template, indent=2))

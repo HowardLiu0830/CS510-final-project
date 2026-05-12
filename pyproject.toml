@@ -34,6 +34,7 @@ dependencies = [
   "python-dotenv",
   "pandas",
   "numpy",
+  "scikit-learn",
   "tqdm",
 ]
 
@@ -49,6 +50,7 @@ dev = [
 
 [project.scripts]
 research-trail-agent = "research_trail.cli:run_agent"
+research-trail-baseline = "research_trail.cli:run_baseline"
 research-trail-eval = "research_trail.cli:run_eval"
 research-trail-runs-to-jsonl = "research_trail.cli:runs_to_jsonl"
 research-trail-scaffold-human-eval = "research_trail.cli:scaffold_human_eval"

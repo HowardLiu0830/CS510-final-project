@@ -5,7 +5,7 @@ from __future__ import annotations
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from research_trail.config import get_settings
-from research_trail.search.base import BaseSearchClient, Paper
+from research_trail.search.base import BaseSearchClient, Paper, _passes_year_filter
 
 
 class OpenAlexClient(BaseSearchClient):
@@ -20,16 +20,26 @@ class OpenAlexClient(BaseSearchClient):
         self._pyalex = pyalex
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
-    def search(self, query: str, limit: int = 20) -> list[Paper]:
-        works = self._pyalex.Works().search(query).get(per_page=limit)
+    def search(
+        self, query: str, limit: int = 20, *, year_max: int | None = None
+    ) -> list[Paper]:
+        # OpenAlex supports ``to_publication_date`` as a server-side filter,
+        # so cap at year-end for an inclusive year boundary.
+        q = self._pyalex.Works().search(query)
+        if year_max is not None:
+            q = q.filter(to_publication_date=f"{year_max}-12-31")
+        works = q.get(per_page=limit)
         out: list[Paper] = []
         for w in works:
+            year = w.get("publication_year")
+            if not _passes_year_filter(year, year_max):
+                continue
             out.append(
                 Paper(
                     id=w.get("id", ""),
                     title=w.get("title") or "",
                     abstract=_invert_abstract(w.get("abstract_inverted_index")),
-                    year=w.get("publication_year"),
+                    year=year,
                     authors=[
                         (a.get("author") or {}).get("display_name", "")
                         for a in w.get("authorships", [])

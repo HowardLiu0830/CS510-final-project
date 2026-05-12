@@ -45,25 +45,62 @@ def build_concept_graph(extractions: list[Extraction]) -> dict[str, Any]:
     edges connect papers to the concepts they assert/use. Concept node IDs are
     normalized (lowercase + collapsed whitespace) so the same concept mentioned
     by multiple papers merges into one node, revealing shared themes across the
-    literature. The display label keeps the first-seen original casing.
+    literature.
+
+    When ``settings.concept_merge_threshold`` is set, an embedding-based
+    clustering step runs before the string normalize so semantically equivalent
+    labels ("GNN" / "graph neural network") collapse into the same node. The
+    display label is the most frequent label per cluster.
 
     Returns a JSON-able dict suitable for ``streamlit-agraph`` or ``pyvis``.
     """
+    from research_trail.config import get_settings
+    from research_trail.graph.embedding import build_canonical_map
+
+    threshold = get_settings().concept_merge_threshold
+
+    # Build a (raw_text → key) lookup per extraction so we cluster on the
+    # short concept keys (when available) and then map back to display the
+    # canonical key as the node label. Short keys ("gnn for drug discovery")
+    # have much higher cross-paper cosine similarity than full claim
+    # sentences, so clustering on them recovers real semantic structure.
+    # Fall back to the raw text when a key is missing (offline stub /
+    # older runs without claim_keys).
+    def _build_pairs(items: list[str], keys: list[str]) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        for i, text in enumerate(items):
+            key = keys[i] if i < len(keys) and keys[i] else text
+            pairs.append((text, key))
+        return pairs
+
+    claim_pairs = [(text, key) for ext in extractions
+                   for text, key in _build_pairs(ext.claims, ext.claim_keys)]
+    method_pairs = [(text, key) for ext in extractions
+                    for text, key in _build_pairs(ext.methods, ext.method_keys)]
+    all_claim_keys = [k for _, k in claim_pairs]
+    all_method_keys = [k for _, k in method_pairs]
+    claim_canon = build_canonical_map(all_claim_keys, threshold)
+    method_canon = build_canonical_map(all_method_keys, threshold)
+
     g = nx.DiGraph()
 
     methods_by_paper: dict[str, set[str]] = defaultdict(set)
     for ext in extractions:
         paper_node = f"paper:{ext.paper_id}"
         g.add_node(paper_node, kind="paper", label=ext.paper_id)
-        for claim in ext.claims:
-            cn = f"claim:{_normalize(claim)}"
+        for i, claim in enumerate(ext.claims):
+            key = ext.claim_keys[i] if i < len(ext.claim_keys) and ext.claim_keys[i] else claim
+            label = claim_canon.get(key, key)
+            cn = f"claim:{_normalize(label)}"
             if not g.has_node(cn):
-                g.add_node(cn, kind="claim", label=claim)
+                g.add_node(cn, kind="claim", label=label)
             g.add_edge(paper_node, cn, relation="asserts")
-        for method in ext.methods:
-            mn = f"method:{_normalize(method)}"
+        for i, method in enumerate(ext.methods):
+            key = ext.method_keys[i] if i < len(ext.method_keys) and ext.method_keys[i] else method
+            label = method_canon.get(key, key)
+            mn = f"method:{_normalize(label)}"
             if not g.has_node(mn):
-                g.add_node(mn, kind="method", label=method)
+                g.add_node(mn, kind="method", label=label)
             g.add_edge(paper_node, mn, relation="uses")
             methods_by_paper[paper_node].add(mn)
 

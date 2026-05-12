@@ -17,13 +17,23 @@ from research_trail.search.base import Paper
 logger = logging.getLogger(__name__)
 
 
-def _cache_path(cache_dir: Path, source: str, query: str, limit: int) -> Path:
-    key = hashlib.sha256(f"{source}:{query}:{limit}".encode()).hexdigest()
+def _cache_path(
+    cache_dir: Path, source: str, query: str, limit: int, year_max: int | None = None
+) -> Path:
+    # ``year_max`` is part of the key so a 2020-cutoff query and an
+    # unfiltered query don't share results.
+    key = hashlib.sha256(f"{source}:{query}:{limit}:y{year_max}".encode()).hexdigest()
     return cache_dir / source / f"{key}.json"
 
 
-def load_cached(cache_dir: Path, source: str, query: str, limit: int) -> list[Paper] | None:
-    path = _cache_path(cache_dir, source, query, limit)
+def load_cached(
+    cache_dir: Path,
+    source: str,
+    query: str,
+    limit: int,
+    year_max: int | None = None,
+) -> list[Paper] | None:
+    path = _cache_path(cache_dir, source, query, limit, year_max)
     if not path.exists():
         return None
     try:
@@ -37,9 +47,14 @@ def load_cached(cache_dir: Path, source: str, query: str, limit: int) -> list[Pa
 
 
 def save_cached(
-    cache_dir: Path, source: str, query: str, limit: int, papers: list[Paper]
+    cache_dir: Path,
+    source: str,
+    query: str,
+    limit: int,
+    papers: list[Paper],
+    year_max: int | None = None,
 ) -> None:
-    path = _cache_path(cache_dir, source, query, limit)
+    path = _cache_path(cache_dir, source, query, limit, year_max)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(

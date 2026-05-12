@@ -25,9 +25,19 @@ from langchain_core.callbacks import BaseCallbackHandler
 
 from research_trail.config import PROJECT_ROOT, get_settings
 
-_RUNS_ROOT = PROJECT_ROOT / "data" / "runs"
+_DEFAULT_RUNS_ROOT = PROJECT_ROOT / "data" / "runs"
 _LOGGER_NAME = "research_trail"
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _runs_root() -> Path:
+    """Return the active runs root, honouring settings.runs_root_override.
+
+    Read each call so the parallel-variant runner can flip the env var
+    between worktrees without restarting the process.
+    """
+    override = get_settings().runs_root_override
+    return Path(override) if override else _DEFAULT_RUNS_ROOT
 
 _current_node: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "research_trail_current_node", default=None
@@ -43,8 +53,8 @@ def _slugify(text: str, max_len: int = 60) -> str:
 
 
 def make_run_dir(query: str, root: Path | None = None) -> Path:
-    """Create and return a fresh ``data/runs/<ts>__<slug>/`` directory."""
-    base = root or _RUNS_ROOT
+    """Create and return a fresh ``<runs_root>/<ts>__<slug>/`` directory."""
+    base = root or _runs_root()
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
     run_dir = base / f"{ts}__{_slugify(query)}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -123,6 +133,21 @@ def _extract_token_usage(response: Any) -> dict[str, int]:
     return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
 
 
+def _normalise_model_for_pricing(model: str | None) -> str | None:
+    """Map the model name we sent on the wire to what litellm expects.
+
+    Matches the per-model routing in ``llm/client.py``: any model name with
+    a ``/`` is routed via OpenRouter, so litellm needs the ``openrouter/``
+    prefix to find pricing for it. Bare names (``gpt-4o-mini``) hit OpenAI
+    directly and litellm already knows them.
+    """
+    if not model:
+        return model
+    if "/" in model and not model.startswith("openrouter/"):
+        return f"openrouter/{model}"
+    return model
+
+
 def _compute_cost(model: str | None, prompt_tokens: int, completion_tokens: int) -> tuple[float, bool]:
     """Return (cost_usd, unknown_model). Falls back to (0.0, True) if litellm
     has no pricing entry for the model — surfaced so callers can flag the run.
@@ -133,7 +158,7 @@ def _compute_cost(model: str | None, prompt_tokens: int, completion_tokens: int)
         import litellm
 
         prompt_cost, completion_cost = litellm.cost_per_token(
-            model=model,
+            model=_normalise_model_for_pricing(model),
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
         )
@@ -336,14 +361,21 @@ def _package_version() -> str | None:
 
 def _write_meta(run_dir: Path, *, query: str, started_at: float, ended_at: float) -> None:
     s = get_settings()
+    # Prefer the per-run override (set by `override_model`) over the default
+    # from settings so model-ablation runs report the model they actually used.
+    from research_trail.llm.client import _model_override
+
+    effective_model = _model_override.get() or s.openai_model
     meta = {
         "query": query,
         "started_at": datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat(),
         "ended_at": datetime.fromtimestamp(ended_at, tz=timezone.utc).isoformat(),
         "duration_s": round(ended_at - started_at, 3),
         "offline": s.offline,
-        "model": s.openai_model,
+        "model": effective_model,
+        "base_url": s.openai_base_url,
         "openai_api_key": _redact(s.openai_api_key),
+        "openrouter_api_key": _redact(s.openrouter_api_key),
         "s2_api_key": _redact(s.s2_api_key),
         "openalex_email": s.openalex_email,
         "package_version": _package_version(),

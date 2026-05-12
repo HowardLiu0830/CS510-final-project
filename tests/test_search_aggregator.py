@@ -11,14 +11,14 @@ class _FakeClient(BaseSearchClient):
         self.source_name = name
         self._papers = papers
 
-    def search(self, query: str, limit: int = 20) -> list[Paper]:
+    def search(self, query: str, limit: int = 20, *, year_max: int | None = None) -> list[Paper]:
         return list(self._papers[:limit])
 
 
 class _BoomClient(BaseSearchClient):
     source_name = "boom"
 
-    def search(self, query: str, limit: int = 20) -> list[Paper]:
+    def search(self, query: str, limit: int = 20, *, year_max: int | None = None) -> list[Paper]:
         raise RuntimeError("network exploded")
 
 

@@ -6,18 +6,23 @@ from research_trail.evaluation.metrics import aggregate_scores
 from research_trail.evaluation.rubric import Rubric, RubricScore
 
 
-def _rub(
-    judge_id: str, vals: tuple[int, int, int, int], query: str = "q"
-) -> Rubric:
-    r, c, s, i = vals
+def _rub(judge_id: str, vals: tuple[int, ...], query: str = "q") -> Rubric:
+    # Tuple order matches DIMENSIONS:
+    # review_relevance, review_coverage, review_groundedness, review_synthesis,
+    # gap_relevance, gap_specificity, gap_novelty, gap_significance.
+    rr, rc, rg, rs, gr, gs, gn, gsg = vals
     return Rubric(
         judge_id=judge_id,
         query=query,
         score=RubricScore(
-            relevance=r,
-            coverage=c,
-            structural_organization=s,
-            insightfulness=i,
+            review_relevance=rr,
+            review_coverage=rc,
+            review_groundedness=rg,
+            review_synthesis=rs,
+            gap_relevance=gr,
+            gap_specificity=gs,
+            gap_novelty=gn,
+            gap_significance=gsg,
         ),
     )
 
@@ -28,13 +33,14 @@ def test_aggregate_empty():
 
 def test_aggregate_basic():
     rubrics = [
-        _rub("llm:a", (4, 4, 4, 4)),
-        _rub("human:b", (2, 4, 4, 2)),
+        _rub("llm:a", (4, 4, 4, 4, 4, 4, 4, 4)),
+        _rub("human:b", (2, 4, 4, 2, 2, 4, 2, 4)),
     ]
     out = aggregate_scores(rubrics)
     assert out["n"] == 2
-    assert out["relevance"] == 3.0
-    assert out["coverage"] == 4.0
+    assert out["review_relevance"] == 3.0
+    assert out["review_coverage"] == 4.0
+    assert out["gap_specificity"] == 4.0
     assert 2.5 <= out["overall"] <= 4.5
 
 
@@ -43,20 +49,22 @@ def test_offline_judge_returns_rubric():
     from research_trail.evaluation.llm_judge import judge
 
     rub = judge("test query", {"papers": []})
-    assert 1 <= rub.score.relevance <= 5
+    assert 1 <= rub.score.review_relevance <= 5
+    assert 1 <= rub.score.review_groundedness <= 5
+    assert 1 <= rub.score.gap_specificity <= 5
     assert rub.score.rationale  # non-empty stub rationale
 
 
 def test_aggregate_per_judge_breakdown():
     rubrics = [
-        _rub("llm:a", (4, 4, 4, 4)),
-        _rub("llm:a", (2, 2, 2, 2), query="q2"),
-        _rub("human:b", (3, 3, 3, 3)),
+        _rub("llm:a", (4, 4, 4, 4, 4, 4, 4, 4)),
+        _rub("llm:a", (2, 2, 2, 2, 2, 2, 2, 2), query="q2"),
+        _rub("human:b", (3, 3, 3, 3, 3, 3, 3, 3)),
     ]
     out = aggregate_scores(rubrics)
     pj = out["per_judge"]
     assert pj["llm:a"]["n"] == 2
-    assert pj["llm:a"]["relevance"] == 3.0
+    assert pj["llm:a"]["review_relevance"] == 3.0
     assert pj["llm:a"]["overall"] == 3.0
     assert pj["human:b"]["n"] == 1
     assert pj["human:b"]["overall"] == 3.0
@@ -65,24 +73,27 @@ def test_aggregate_per_judge_breakdown():
 def test_aggregate_inter_rater_agreement():
     # two judges scoring the same query → IRR computable
     rubrics = [
-        _rub("llm:a", (5, 5, 5, 5), query="q1"),
-        _rub("human:b", (3, 5, 5, 3), query="q1"),
+        _rub("llm:a", (5, 5, 5, 5, 5, 5, 5, 5), query="q1"),
+        _rub("human:b", (3, 5, 5, 3, 3, 5, 3, 5), query="q1"),
         # one query with only one judge → ignored by IRR
-        _rub("llm:a", (4, 4, 4, 4), query="q-solo"),
+        _rub("llm:a", (4, 4, 4, 4, 4, 4, 4, 4), query="q-solo"),
     ]
     out = aggregate_scores(rubrics)
     agreement = out["agreement"]
     assert agreement["queries_with_multiple_judges"] == 1
-    # relevance: vals=[5,3] → pop std = 1.0, pairwise mad = 2.0
-    assert agreement["relevance_std"] == 1.0
-    assert agreement["relevance_pairwise_mad"] == 2.0
-    # coverage: vals=[5,5] → std 0, mad 0
-    assert agreement["coverage_std"] == 0.0
-    assert agreement["coverage_pairwise_mad"] == 0.0
+    # review_relevance: vals=[5,3] → pop std = 1.0, pairwise mad = 2.0
+    assert agreement["review_relevance_std"] == 1.0
+    assert agreement["review_relevance_pairwise_mad"] == 2.0
+    # review_coverage: vals=[5,5] → std 0, mad 0
+    assert agreement["review_coverage_std"] == 0.0
+    assert agreement["review_coverage_pairwise_mad"] == 0.0
 
 
 def test_aggregate_no_irr_when_only_one_judge():
-    rubrics = [_rub("llm:a", (4, 4, 4, 4)), _rub("llm:a", (2, 2, 2, 2), query="q2")]
+    rubrics = [
+        _rub("llm:a", (4, 4, 4, 4, 4, 4, 4, 4)),
+        _rub("llm:a", (2, 2, 2, 2, 2, 2, 2, 2), query="q2"),
+    ]
     out = aggregate_scores(rubrics)
     assert out["agreement"]["queries_with_multiple_judges"] == 0
 
@@ -103,10 +114,14 @@ def test_run_eval_merges_human_forms(tmp_path):
                 "query": "q",
                 "system_output": {},
                 "score": {
-                    "relevance": 3,
-                    "coverage": 3,
-                    "structural_organization": 3,
-                    "insightfulness": 3,
+                    "review_relevance": 3,
+                    "review_coverage": 3,
+                    "review_groundedness": 3,
+                    "review_synthesis": 3,
+                    "gap_relevance": 3,
+                    "gap_specificity": 3,
+                    "gap_novelty": 3,
+                    "gap_significance": 3,
                     "rationale": "ok",
                 },
             }
@@ -139,4 +154,9 @@ def test_scaffold_human_eval_writes_forms(tmp_path):
     assert len(forms) == 2
     data = json.loads(forms[0].read_text())
     assert data["query"] == "q1"
-    assert "score" in data
+    # Anchored definitions should be embedded so reviewers grade on the same rubric.
+    assert "_review_relevance_anchors" in data["score"]
+    assert "_gap_specificity_anchors" in data["score"]
+    # The old top-level names should no longer appear.
+    assert "structural_organization" not in data["score"]
+    assert "insightfulness" not in data["score"]

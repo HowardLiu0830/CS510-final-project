@@ -53,3 +53,48 @@ def test_build_graph_empty_input():
 
     assert g["nodes"] == []
     assert g["edges"] == []
+
+
+def test_graph_merges_synonyms_with_embedding_threshold(monkeypatch):
+    """When concept_merge_threshold is set, semantically equivalent labels
+    (faked via a mocked canonical map) collapse into a single node even
+    when their string-normalized forms differ.
+    """
+    from research_trail.graph import embedding
+
+    # Pretend embeddings clustered "GNN" and "graph neural network" together
+    # with canonical "graph neural network". Same for drug-discovery variants.
+    def fake_canonical(labels, threshold):
+        canon = {}
+        for lbl in labels:
+            lower = lbl.lower()
+            if "gnn" in lower or "graph neural network" in lower:
+                canon[lbl] = "graph neural network"
+            elif "drug discovery" in lower or "drug design" in lower:
+                canon[lbl] = "drug discovery"
+            else:
+                canon[lbl] = lbl
+        return canon
+
+    monkeypatch.setattr(embedding, "build_canonical_map", fake_canonical)
+    # Flip the threshold so the code-path inside build_concept_graph
+    # passes a non-None threshold into our fake.
+    monkeypatch.setenv("CONCEPT_MERGE_THRESHOLD", "0.80")
+
+    exts = [
+        Extraction(paper_id="P1", claims=["GNN for drug discovery"], methods=["GNN"]),
+        Extraction(
+            paper_id="P2",
+            claims=["Graph Neural Network for drug design"],
+            methods=["graph neural network"],
+        ),
+    ]
+    g = build_concept_graph(exts)
+
+    claim_ids = {n["id"] for n in g["nodes"] if n["kind"] == "claim"}
+    method_ids = {n["id"] for n in g["nodes"] if n["kind"] == "method"}
+    # Both papers' claims should land on the same canonical claim node.
+    assert len(claim_ids) == 1
+    # Same for methods.
+    assert len(method_ids) == 1
+    assert "graph neural network" in next(iter(method_ids))
