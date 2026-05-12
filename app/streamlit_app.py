@@ -249,13 +249,14 @@ def _expand_node(concept_label: str, result: dict) -> None:
         # Re-bind the run's LLM handler + node name so extractions kicked off
         # by this button still land in messages.jsonl and the cost accumulator.
         with _attribute_to("expand_topic"):
-            ctx = contextvars.copy_context()
-
-            def _run(paper):
+            def _run(paper: Any, ctx: contextvars.Context) -> Any:
                 return ctx.run(extract_from_paper, paper)
 
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                new_extractions = list(pool.map(_run, fresh))
+                new_extractions = list(pool.map(
+                    lambda args: _run(*args),
+                    [(p, contextvars.copy_context()) for p in fresh],
+                ))
 
         result["papers"] = result.get("papers", []) + fresh
         all_extractions = result.get("extractions", []) + new_extractions
