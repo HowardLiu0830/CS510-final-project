@@ -480,11 +480,19 @@ def _extract_with_progress(papers: list) -> list:
 
     n_tok = _current_node.set("screen_and_extract")
     try:
-        # Python 3.12+: ThreadPoolExecutor copies the calling context automatically
-        # at submit time, so _current_node is visible in worker threads without
-        # a manual ctx.run() wrapper (which would double-enter the context and crash).
+        # Each worker needs its own Context copy: a single shared ctx object can
+        # only be entered by one thread at a time, so concurrent ctx.run() calls
+        # on the same object race and crash. Copying once per paper in the main
+        # thread (where _current_node is already set) gives each worker an
+        # independent context with the correct node name.
+        def _run(paper: Any, ctx: contextvars.Context) -> Any:
+            return ctx.run(extract_from_paper, paper)
+
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            future_to_idx = {pool.submit(extract_from_paper, p): i for i, p in enumerate(papers)}
+            future_to_idx = {
+                pool.submit(_run, p, contextvars.copy_context()): i
+                for i, p in enumerate(papers)
+            }
             done = 0
             for fut in as_completed(future_to_idx):
                 idx = future_to_idx[fut]
