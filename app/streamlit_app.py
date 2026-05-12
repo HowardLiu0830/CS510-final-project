@@ -324,6 +324,11 @@ def _render_node_inspector(
                 if st.button("Expand topic", key=f"expand_{node_id}", type="primary"):
                     _expand_node(label, st.session_state.result)
                     st.rerun()
+            elif kind == "paper" and node_id in paper_index:
+                _, paper = paper_index[node_id]
+                if st.button("Expand topic", key=f"expand_{node_id}", type="primary"):
+                    _expand_node(paper.title, st.session_state.result)
+                    st.rerun()
 
 
 # ── pipeline execution ────────────────────────────────────────────────────────
